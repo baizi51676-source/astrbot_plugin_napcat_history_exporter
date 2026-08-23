@@ -450,10 +450,30 @@ class NapcatHistoryExporter(Star):
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        files = list(self.export_dir.glob("*.jsonl"))
-        lines = [f"模式: {self.mode}"
-                 f"（定时间隔 {self.interval}s）", f"导出目录: {self.export_dir}",
-                 f"JSONL 文件数: {len(files)}"]
+        exp = self.export_dir.resolve()
+        files = sorted(p.name for p in exp.glob("*.jsonl"))
+        lines = [
+            f"模式: {self.mode}（定时间隔 {self.interval}s）",
+            f"导出目录(配置值): {self.export_dir!r}",
+            f"导出目录(绝对路径): {exp}",
+            f"state.json 路径: {self.state_file.resolve()}",
+            f"JSONL 文件数: {len(files)}",
+        ]
+        if files:
+            lines.append("JSONL 文件列表:\n  " + "\n  ".join(files[:20]))
+        # 列出导出目录内的所有内容（含 state.json）
+        try:
+            items = sorted(p.name for p in exp.iterdir())
+            lines.append(f"导出目录内容({len(items)}项): "
+                         + (", ".join(items[:30]) if items else "(空)"))
+        except Exception as e:
+            lines.append(f"读取导出目录失败: {e}")
+        # state.json 实际内容摘要
+        try:
+            raw = self.state_file.read_text(encoding="utf-8")
+            lines.append(f"state.json 内容: {raw[:400]}")
+        except Exception as e:
+            lines.append(f"读取 state.json 失败: {e}")
         for chat in ("group", "private"):
             st = self._state.get(chat, {})
             if st:
