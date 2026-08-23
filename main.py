@@ -392,6 +392,36 @@ class NapcatHistoryExporter(Star):
         written = await self._auto_export_once()
         return f"✅ 全量增量导出完成，本轮新增 {written} 条（目录: {self.export_dir}）"
 
+    @filter.llm_tool("debug_group_history_api")
+    async def debug_group_history_api(self, event: AstrMessageEvent,
+                                      group_id: str):
+        '''
+        诊断工具：直接调用 NapCat get_group_msg_history 接口并返回原始响应。
+        用于排查"定时导出 0 条/无文件"问题——可以看到 NapCat 到底返回了什么
+        （retcode、message、消息数量等）。
+
+        Args:
+          group_id(string): 目标 QQ 群号（纯数字，必填）
+
+        返回: NapCat 原始响应 JSON（截断 1500 字符）
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        gid = group_id.strip()
+        if not gid.isdigit():
+            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        client = self._get_client()
+        if client is None:
+            return "❌ 未获取到 aiocqhttp 客户端，请检查适配器配置。"
+        try:
+            resp = await client.call_action(
+                "get_group_msg_history", group_id=gid,
+                message_seq="0", count=5)
+        except Exception as e:
+            return f"❌ 调用 get_group_msg_history 异常: {e}"
+        s = json.dumps(resp, ensure_ascii=False)[:1500]
+        return f"get_group_msg_history({gid}) 原始响应:\n{s}"
+
     @filter.llm_tool("get_export_status")
     async def get_export_status(self, event: AstrMessageEvent):
         '''
