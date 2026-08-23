@@ -154,6 +154,12 @@ class NapcatHistoryExporter(Star):
 
         注意：NapCat 的 get_group_msg_history / get_friend_msg_history
         要求 group_id / user_id / message_seq 均为字符串类型。
+
+        aiocqhttp 的 call_action 已自动解包，resp 可能是：
+          a) {"messages": [...]}                    —— NapCat 实际返回（解包后）
+          b) {"data": {"messages": [...]}}          —— 标准 OneBot 包装
+          c) {"data": [...]}                        —— data 直接是列表
+          d) {"status": "failed", "retcode": 1400}  —— 调用失败
         """
         client = self._get_client()
         if client is None:
@@ -168,28 +174,32 @@ class NapcatHistoryExporter(Star):
         if not isinstance(resp, dict):
             logger.warning(f"{action}({target_id}) 返回异常: {resp!r}")
             return []
-        # 检查 NapCat 返回状态（retcode != 0 表示失败，data 可能为 null）
-        retcode = resp.get("retcode", 0)
+        # 失败检测
+        retcode = resp.get("retcode")
         if resp.get("status") == "failed" or (retcode is not None and retcode != 0):
             logger.warning(
                 f"{action}({target_id}) 调用失败: retcode={retcode} "
                 f"message={resp.get('message')!r} wording={resp.get('wording')!r}")
             return []
-        data = resp.get("data")
-        if isinstance(data, dict):
-            msgs = data.get("messages") or []
-            if not msgs:
-                logger.warning(
-                    f"{action}({target_id}) 返回空消息列表"
-                    f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
-            return msgs
-        if isinstance(data, list):
-            if not data:
-                logger.warning(
-                    f"{action}({target_id}) 返回空消息列表"
-                    f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
-            return data
-        return []
+        # 解析消息列表（兼容三种结构）
+        msgs = None
+        if "messages" in resp:
+            msgs = resp.get("messages")
+        else:
+            data = resp.get("data")
+            if isinstance(data, dict):
+                msgs = data.get("messages")
+            elif isinstance(data, list):
+                msgs = data
+        if msgs is None:
+            logger.warning(f"{action}({target_id}) 返回格式无法解析: {str(resp)[:200]}")
+            return []
+        if not msgs:
+            logger.warning(
+                f"{action}({target_id}) 返回空消息列表"
+                f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
+            return []
+        return msgs
 
     @staticmethod
     def _seq_of(msg: dict) -> int:
