@@ -237,7 +237,13 @@ class NapcatHistoryExporter(Star):
                 action, **{key: str(target_id), "message_seq": str(start_seq),
                            "count": count})
         except Exception as e:
-            logger.error(f"调用 {action}({target_id}) 失败: {e}")
+            # v1.3.2: NapCat 翻页锚点消息不存在（retcode=1200，如 message_seq 传了
+            # 不存在的 id）属预期行为 → 降级为 warning，停止翻页（已获取的消息保留）
+            msg = str(e)
+            if "不存在" in msg or getattr(e, "retcode", None) == 1200:
+                logger.warning(f"{action}({target_id}) 翻页停止: {msg}")
+            else:
+                logger.error(f"调用 {action}({target_id}) 失败: {e}")
             return []
         if not isinstance(resp, dict):
             logger.warning(f"{action}({target_id}) 返回异常: {resp!r}")
@@ -355,8 +361,9 @@ class NapcatHistoryExporter(Star):
                 else:
                     if any(self._time_of(m) <= last_t for m in msgs):
                         break
-            # 向前翻页（拿更早的）：用最小 message_seq-1 定位
-            start = min(self._seq_of(m) for m in msgs) - 1
+            # 向前翻页（拿更早的）：v1.3.2 传页内最小 message_seq（真实存在的
+            # 消息 ID 作为锚点，NapCat 返回其之前更早的消息；不再 -1 以免锚点不存在）
+            start = min(self._seq_of(m) for m in msgs)
             if start < 1 or len(fetched) >= 5000:
                 break
         if not fetched:
@@ -379,7 +386,14 @@ class NapcatHistoryExporter(Star):
         new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
         seen |= set(new_ids)
         cur = self._state.setdefault(chat, {})
-        cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
+        if today_only:
+            # v1.3.2: 当天模式游标不推进（固定为今天 0 点 -1 秒），
+            # 每轮都尝试拉取当天全部消息，配合 message_id 去重：
+            # 翻页失败时也不漏"最新"消息，翻页可用时能补全当天更早的
+            cur[target_id] = {"t": today_start - 1,
+                              "ids": list(seen)[-5000:]}
+        else:
+            cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
         self._save_state()
         return written
 
