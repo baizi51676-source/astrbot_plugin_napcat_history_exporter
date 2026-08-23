@@ -44,7 +44,7 @@
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `export_dir` | `data/plugins/napcat_history_exporter/export` | 导出目录 |
+| `export_dir` | `data/workspaces/napcat_exports` | 导出目录（与日志归档插件同级，位于 AstrBot 工作目录的 `data/workspaces/` 下）|
 | `mode` | `auto` | `auto` 定时增量 / `manual` 按需触发 |
 | `interval_seconds` | `120` | 定时循环间隔（最小 30s）|
 | `count_per_batch` | `50` | 单次 API 拉取条数（1-200）|

@@ -2,8 +2,8 @@
   "export_dir": {
     "description": "导出目录（JSONL 文件与游标状态存放位置）",
     "type": "string",
-    "default": "data/plugins/napcat_history_exporter/export",
-    "hint": "相对 AstrBot 工作目录。与特殊版插件（astrbot_plugin_group_forwarder_special）联动搜索时，可把此目录告知其配置。"
+    "default": "data/workspaces/napcat_exports",
+    "hint": "相对 AstrBot 工作目录（如 /root/astrbot）。默认与日志归档插件的 workspaces 同级（data/workspaces/napcat_exports）。与特殊版插件（astrbot_plugin_group_forwarder_special）联动搜索时，在特殊版配置中把 export_dir 设成同一路径即可。"
   },
   "mode": {
     "description": "导出模式",

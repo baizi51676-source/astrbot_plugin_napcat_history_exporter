@@ -38,7 +38,7 @@ class NapcatHistoryExporter(Star):
         super().__init__(context)
         self.config = config
         self.export_dir = Path(config.get(
-            "export_dir", "data/plugins/napcat_history_exporter/export"))
+            "export_dir", "data/workspaces/napcat_exports"))
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.mode = str(config.get("mode", "auto"))
         self.interval = max(30, int(config.get("interval_seconds", 120)))
