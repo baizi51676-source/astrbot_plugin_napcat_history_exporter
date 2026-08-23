@@ -1,0 +1,38 @@
+{
+  "export_dir": {
+    "description": "导出目录（JSONL 文件与游标状态存放位置）",
+    "type": "string",
+    "default": "data/plugins/napcat_history_exporter/export",
+    "hint": "相对 AstrBot 工作目录。与特殊版插件（astrbot_plugin_group_forwarder_special）联动搜索时，可把此目录告知其配置。"
+  },
+  "mode": {
+    "description": "导出模式",
+    "type": "string",
+    "default": "auto",
+    "hint": "auto=定时循环增量导出（默认 120s 一次）；manual=仅被 LLM 工具/指令触发时导出。"
+  },
+  "interval_seconds": {
+    "description": "定时循环间隔（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "auto 模式下每隔该秒数检查一次各群是否有新消息并增量导出。最小值 30。"
+  },
+  "count_per_batch": {
+    "description": "单次 API 拉取条数",
+    "type": "int",
+    "default": 50,
+    "hint": "每次调用 get_group_msg_history / get_friend_msg_history 拉取的条数（1-200）。"
+  },
+  "auto_export_friends": {
+    "description": "定时模式同时导出私聊",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后定时循环也会增量导出所有好友的私聊记录（需 NapCat 保存有聊天记录）。"
+  },
+  "admin_only": {
+    "description": "仅管理员可以使用导出工具",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后只有 AstrBot 管理员可以调用导出相关 LLM 工具。"
+  }
+}

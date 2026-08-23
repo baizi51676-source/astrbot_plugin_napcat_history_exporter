@@ -1,0 +1,11 @@
+name: astrbot_plugin_napcat_history_exporter
+desc: 通过 NapCat 扩展 API 将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出（默认 120s）与按需触发两种模式，可供搜索插件联动
+author: baizi51676-source
+version: 1.0.0
+repo: https://github.com/baizi51676-source/astrbot_plugin_napcat_history_exporter
+display_name: NapCat 历史记录导出器
+short_desc: 导出 NapCat 历史聊天记录为 JSONL（定时增量/按需触发）
+category: 工具
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.0.0,<5"
