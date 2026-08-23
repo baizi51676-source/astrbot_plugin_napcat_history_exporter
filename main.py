@@ -40,6 +40,7 @@ class NapcatHistoryExporter(Star):
         self.export_dir = Path(config.get(
             "export_dir", "data/workspaces/napcat_exports"))
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_files()  # v1.1.0: 旧按天文件合并为单文件
         self.mode = str(config.get("mode", "auto"))
         self.interval = max(30, int(config.get("interval_seconds", 120)))
         self.batch = max(1, min(int(config.get("count_per_batch", 50)), 200))
@@ -139,9 +140,56 @@ class NapcatHistoryExporter(Star):
             return "unknown"
 
     def _target_path(self, chat: str, target_id: str, date: str) -> Path:
+        # v1.1.0: 每目标只保留一个文件（跨天合并），不再按天分文件
         if chat == "group":
-            return self.export_dir / f"napcat_{target_id}_{date}.jsonl"
-        return self.export_dir / f"napcat_private_{target_id}_{date}.jsonl"
+            return self.export_dir / f"napcat_{target_id}.jsonl"
+        return self.export_dir / f"napcat_private_{target_id}.jsonl"
+
+    def _migrate_legacy_files(self) -> None:
+        """v1.1.0 迁移：旧格式 napcat_<群>_YYYY-MM-DD.jsonl → 合并为单文件。
+
+        将同一目标的所有旧按天文件按时间排序合并写入
+        napcat_<群>.jsonl / napcat_private_<uid>.jsonl，随后删除旧文件。
+        """
+        try:
+            if not self.export_dir.is_dir():
+                return
+            groups: dict = {}  # 目标文件名 → 行列表
+            import re as _re
+            for p in sorted(self.export_dir.glob("napcat_*_????-??-??.jsonl")):
+                m = _re.match(
+                    r"napcat_(private_)?(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$", p.name)
+                if not m:
+                    continue
+                target = f"napcat_{m.group(1) or ''}{m.group(2)}.jsonl"
+                try:
+                    lines = [ln for ln in
+                             p.read_text(encoding="utf-8", errors="replace")
+                             .splitlines() if ln.strip()]
+                except Exception as e:
+                    logger.error(f"[NapCatExporter] 迁移读取失败 {p.name}: {e}")
+                    continue
+                if lines:
+                    groups.setdefault(target, []).extend(lines)
+                p.unlink(missing_ok=True)
+                logger.info(f"[NapCatExporter] 迁移: {p.name} → {target}"
+                            f"（{len(lines)}行，旧文件已删除）")
+            for target, lines in groups.items():
+                # 按行内 t 字段排序（消息时间），保证合并后有序
+                try:
+                    lines.sort(key=lambda ln: json.loads(ln).get("t", ""))
+                except Exception:
+                    pass
+                path = self.export_dir / target
+                try:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                    logger.info(f"[NapCatExporter] 合并完成: {target}"
+                                f"（共{len(lines)}行）")
+                except Exception as e:
+                    logger.error(f"[NapCatExporter] 合并写入失败 {target}: {e}")
+        except Exception as e:
+            logger.error(f"[NapCatExporter] 旧文件迁移异常: {e}")
 
     def _write_records(self, path: Path, records: list, expect: int = 0) -> None:
         try:
