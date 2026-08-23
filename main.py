@@ -80,8 +80,12 @@ class NapcatHistoryExporter(Star):
         try:
             platform = self.context.get_platform("aiocqhttp")
             if platform is None:
+                logger.warning(
+                    "未找到 aiocqhttp 平台实例（get_platform('aiocqhttp') 返回 None），"
+                    "无法进行定时导出。请确认 AstrBot 已启用 aiocqhttp 适配器连接 NapCat。")
                 return None
             self._client = platform.get_client()
+            logger.info("已获取 aiocqhttp 客户端（CQHttp），可用于调用 NapCat API")
         except Exception as e:
             logger.error(f"获取 aiocqhttp 客户端失败: {e}")
             return None
@@ -243,10 +247,19 @@ class NapcatHistoryExporter(Star):
         except Exception as e:
             logger.error(f"获取群列表失败: {e}")
             groups = []
-        for g in groups or []:
+        groups = groups or []
+        logger.info(f"定时导出开始：共 {len(groups)} 个群")
+        for g in groups:
             gid = str(g.get("group_id", ""))
-            if gid:
-                total += await self._export_target("group", gid)
+            if not gid:
+                continue
+            try:
+                n = await self._export_target("group", gid)
+                if n:
+                    logger.info(f"群 {gid} 新增 {n} 条")
+            except Exception as e:
+                logger.error(f"导出群 {gid} 失败: {e}")
+            total += n
         if self.auto_friends:
             try:
                 friends = await client.call_action("get_friend_list")
@@ -255,13 +268,21 @@ class NapcatHistoryExporter(Star):
                 friends = []
             for f in friends or []:
                 uid = str(f.get("user_id", ""))
-                if uid:
-                    total += await self._export_target("private", uid)
-        if total:
-            logger.info(f"定时导出完成，本轮新增 {total} 条")
+                if not uid:
+                    continue
+                try:
+                    n = await self._export_target("private", uid)
+                    if n:
+                        logger.info(f"私聊 {uid} 新增 {n} 条")
+                except Exception as e:
+                    logger.error(f"导出私聊 {uid} 失败: {e}")
+                total += n
+        logger.info(f"定时导出完成，本轮新增 {total} 条（目录: {self.export_dir.resolve()}）")
         return total
 
     async def _auto_loop(self) -> None:
+        logger.info(f"定时导出循环已启动，间隔 {self.interval}s，"
+                    f"导出目录: {self.export_dir.resolve()}")
         while True:
             try:
                 await self._auto_export_once()
@@ -275,9 +296,13 @@ class NapcatHistoryExporter(Star):
 
     async def initialize(self) -> None:
         if self.mode == "auto":
-            self._task = asyncio.get_event_loop().create_task(self._auto_loop())
-            logger.info("NapCat 历史导出器已启动定时模式（每 %ss 增量导出一次）",
-                        self.interval)
+            self._task = asyncio.create_task(self._auto_loop())
+            logger.info("NapCat 历史导出器已启动定时模式（每 %ss 增量导出一次，"
+                        "导出目录: %s）", self.interval, self.export_dir.resolve())
+        else:
+            logger.info("NapCat 历史导出器当前为 manual 模式，"
+                        "仅在被 LLM 工具触发时导出（导出目录: %s）",
+                        self.export_dir.resolve())
 
     async def terminate(self) -> None:
         if self._task:
