@@ -55,6 +55,7 @@ class NapcatHistoryExporter(Star):
         self._state: dict = self._load_state()
         self._client = None
         self._task: asyncio.Task | None = None
+        self._last_clean: datetime | None = None  # v1.3.1: 上次自动清理时间（每12h一次）
 
     # ---------------------------------------------------------------
     # 内部工具
@@ -490,10 +491,14 @@ class NapcatHistoryExporter(Star):
                 await self._auto_export_once()
             except Exception as e:
                 logger.error(f"定时导出异常: {e}")
-            try:
-                self._cleanup_old_files()
-            except Exception as e:
-                logger.error(f"自动清理异常: {e}")
+            # v1.3.1: 自动清理每 12 小时执行一次（非每轮）
+            if self._last_clean is None or \
+                    datetime.now() - self._last_clean >= timedelta(hours=12):
+                try:
+                    self._cleanup_old_files()
+                    self._last_clean = datetime.now()
+                except Exception as e:
+                    logger.error(f"自动清理异常: {e}")
             await asyncio.sleep(self.interval)
 
     # ---------------------------------------------------------------
