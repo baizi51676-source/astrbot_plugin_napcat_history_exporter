@@ -177,8 +177,17 @@ class NapcatHistoryExporter(Star):
             return []
         data = resp.get("data")
         if isinstance(data, dict):
-            return data.get("messages") or []
+            msgs = data.get("messages") or []
+            if not msgs:
+                logger.warning(
+                    f"{action}({target_id}) 返回空消息列表"
+                    f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
+            return msgs
         if isinstance(data, list):
+            if not data:
+                logger.warning(
+                    f"{action}({target_id}) 返回空消息列表"
+                    f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
             return data
         return []
 
