@@ -150,18 +150,32 @@ class NapcatHistoryExporter(Star):
 
     async def _fetch(self, action: str, key: str, target_id: str,
                      start_seq: int, count: int) -> list:
-        """调用 NapCat 扩展 API 拉取一页历史消息。"""
+        """调用 NapCat 扩展 API 拉取一页历史消息。
+
+        注意：NapCat 的 get_group_msg_history / get_friend_msg_history
+        要求 group_id / user_id / message_seq 均为字符串类型。
+        """
         client = self._get_client()
         if client is None:
             return []
         try:
             resp = await client.call_action(
-                action, **{key: int(target_id), "message_seq": start_seq,
+                action, **{key: str(target_id), "message_seq": str(start_seq),
                            "count": count})
         except Exception as e:
             logger.error(f"调用 {action}({target_id}) 失败: {e}")
             return []
-        data = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(resp, dict):
+            logger.warning(f"{action}({target_id}) 返回异常: {resp!r}")
+            return []
+        # 检查 NapCat 返回状态（retcode != 0 表示失败，data 可能为 null）
+        retcode = resp.get("retcode", 0)
+        if resp.get("status") == "failed" or (retcode is not None and retcode != 0):
+            logger.warning(
+                f"{action}({target_id}) 调用失败: retcode={retcode} "
+                f"message={resp.get('message')!r} wording={resp.get('wording')!r}")
+            return []
+        data = resp.get("data")
         if isinstance(data, dict):
             return data.get("messages") or []
         if isinstance(data, list):
