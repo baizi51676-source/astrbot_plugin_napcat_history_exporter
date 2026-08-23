@@ -300,9 +300,9 @@ class NapcatHistoryExporter(Star):
         适合需要把某群聊天记录保存成文件、供后续搜索/分析的场景。
         与定时模式共用同一套增量游标，重复导出不会产生大量重复数据。
 
-        参数:
-          group_id: 目标 QQ 群号（纯数字）
-          count: 导出的消息条数上限（默认 200，最大 5000）
+        Args:
+          group_id(string): 目标 QQ 群号（纯数字，必填）
+          count(number): 导出的消息条数上限（默认 200，最大 5000）
 
         返回: 导出摘要（新增条数、文件路径）
         '''
@@ -324,9 +324,9 @@ class NapcatHistoryExporter(Star):
         按需导出指定 QQ 好友的私聊历史记录为 JSONL 文件（图片/表情用占位符）。
         注意：NapCat 需保存有与该好友的聊天记录。
 
-        参数:
-          user_id: 目标 QQ 号（纯数字）
-          count: 导出的消息条数上限（默认 200，最大 5000）
+        Args:
+          user_id(string): 目标 QQ 号（纯数字，必填）
+          count(number): 导出的消息条数上限（默认 200，最大 5000）
 
         返回: 导出摘要（新增条数、文件路径）
         '''
