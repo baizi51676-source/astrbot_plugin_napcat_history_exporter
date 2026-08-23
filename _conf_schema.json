@@ -33,6 +33,24 @@
     "description": "仅管理员可以使用导出工具",
     "type": "bool",
     "default": true,
-    "hint": "开启后只有 AstrBot 管理员可以调用导出相关 LLM 工具。"
+    "hint": "开启后只有 AstrBot 管理员可以调用导出相关 LLM 工具。manual 模式始终仅管理员可用。"
+  },
+  "whitelist": {
+    "description": "自动归档群聊白名单（仅循环导出模式生效）",
+    "type": "list",
+    "default": [],
+    "hint": "只对定时循环导出生效：仅在名单内的群才会自动导出聊天文件；留空=全部群。用户/LLM 手动归档不受此限制。"
+  },
+  "auto_clean": {
+    "description": "历史文件自动清理开关（仅循环导出模式生效）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后自动删除超过保留天数的历史 JSONL 文件（手动归档过的目标除外）。"
+  },
+  "clean_days": {
+    "description": "历史文件保留天数",
+    "type": "int",
+    "default": 14,
+    "hint": "仅保留最近 N 天的历史文件，更早的自动删除（默认 14 天）。手动归档过的目标文件不清理。"
   }
 }

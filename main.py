@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import logger, AstrBotConfig
@@ -46,6 +46,11 @@ class NapcatHistoryExporter(Star):
         self.batch = max(1, min(int(config.get("count_per_batch", 50)), 200))
         self.auto_friends = bool(config.get("auto_export_friends", False))
         self.admin_only = bool(config.get("admin_only", True))
+        # v1.3.0: 自动归档白名单 / 历史自动清理（仅循环导出模式生效）
+        self.whitelist = [str(x).strip() for x in (config.get("whitelist") or [])
+                          if str(x).strip()]
+        self.auto_clean = bool(config.get("auto_clean", True))
+        self.clean_days = max(1, int(config.get("clean_days", 14)))
         self.state_file = self.export_dir / "state.json"
         self._state: dict = self._load_state()
         self._client = None
@@ -70,6 +75,9 @@ class NapcatHistoryExporter(Star):
             logger.error(f"保存导出状态失败: {e}")
 
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
+        # v1.3.0: manual 模式（手动触发）仅管理员可用
+        if self.mode == "manual":
+            return event.is_admin()
         if not self.admin_only:
             return True
         return event.is_admin()
@@ -277,11 +285,12 @@ class NapcatHistoryExporter(Star):
             return 0
 
     async def _export_target(self, chat: str, target_id: str,
-                             limit: int = 0) -> int:
+                             limit: int = 0, today_only: bool = False) -> int:
         """导出单个目标。
 
         limit > 0：按需导出最近 limit 条（去重追加，同时更新游标）；
         limit = 0：增量导出（以 time 时间戳为边界 + message_id 去重）。
+        today_only=True（循环导出模式）：只归档当天消息，不导历史。
         返回本次新增写入的条数。
 
         注意：NapCat 返回的 message_seq = message_id（全局消息 ID），
@@ -302,6 +311,11 @@ class NapcatHistoryExporter(Star):
                             f"{st!r}（message_id 不单调，已重置为 0，将全量补导）")
             last_t = 0
             seen = set()
+        # 循环导出模式：只归档当天（本地时区 0 点起）
+        today_start = 0
+        if today_only:
+            today_start = int(datetime.combine(
+                datetime.now().date(), datetime.min.time()).timestamp())
         # NapCat 扩展 API：message_seq=0 表示从最新消息开始，只能往回翻页
         start = 0
         fetched: list = []
@@ -328,10 +342,18 @@ class NapcatHistoryExporter(Star):
                 fresh = [m for m in msgs
                          if self._time_of(m) > last_t
                          and self._mid_of(m) not in seen]
+                if today_only:
+                    # 循环导出只归档当天
+                    fresh = [m for m in fresh
+                             if self._time_of(m) >= today_start]
                 fetched.extend(fresh)
-                # 本页出现 time <= last_t 的消息 → 已到导出边界，停止
-                if any(self._time_of(m) <= last_t for m in msgs):
-                    break
+                if today_only:
+                    # 遇当天之前（含昨天及更早）的消息 → 本页已到当天边界
+                    if any(self._time_of(m) < today_start for m in msgs):
+                        break
+                else:
+                    if any(self._time_of(m) <= last_t for m in msgs):
+                        break
             # 向前翻页（拿更早的）：用最小 message_seq-1 定位
             start = min(self._seq_of(m) for m in msgs) - 1
             if start < 1 or len(fetched) >= 5000:
@@ -360,8 +382,12 @@ class NapcatHistoryExporter(Star):
         self._save_state()
         return written
 
-    async def _auto_export_once(self) -> int:
-        """定时一轮：导出所有群（可选项私聊）的增量消息。"""
+    async def _auto_export_once(self, apply_rules: bool = True) -> int:
+        """定时一轮：导出所有群（可选项私聊）的增量消息。
+
+        apply_rules=True（循环导出模式）：应用群白名单、只归档当天消息；
+        apply_rules=False（用户/LLM 手动触发全量增量）：不过滤，可导历史。
+        """
         client = self._get_client()
         if client is None:
             logger.warning("未获取到 aiocqhttp 客户端，本轮跳过")
@@ -373,13 +399,23 @@ class NapcatHistoryExporter(Star):
             logger.error(f"获取群列表失败: {e}")
             groups = []
         groups = groups or []
+        if apply_rules and self.whitelist:
+            before = len(groups)
+            groups = [g for g in groups
+                      if str(g.get("group_id", "")) in self.whitelist]
+            if len(groups) != before:
+                logger.info(f"白名单过滤：{before} 个群 → {len(groups)} 个（仅白名单内导出）")
+            if not groups:
+                logger.info("白名单内没有可导出的群，本轮跳过")
+                return 0
         logger.info(f"定时导出开始：共 {len(groups)} 个群")
         for g in groups:
             gid = str(g.get("group_id", ""))
             if not gid:
                 continue
             try:
-                n = await self._export_target("group", gid)
+                n = await self._export_target("group", gid,
+                                              today_only=apply_rules)
                 if n:
                     logger.info(f"群 {gid} 新增 {n} 条")
             except Exception as e:
@@ -396,7 +432,8 @@ class NapcatHistoryExporter(Star):
                 if not uid:
                     continue
                 try:
-                    n = await self._export_target("private", uid)
+                    n = await self._export_target("private", uid,
+                                                  today_only=apply_rules)
                     if n:
                         logger.info(f"私聊 {uid} 新增 {n} 条")
                 except Exception as e:
@@ -405,14 +442,58 @@ class NapcatHistoryExporter(Star):
         logger.info(f"定时导出完成，本轮新增 {total} 条（目录: {self.export_dir.resolve()}）")
         return total
 
+    def _cleanup_old_files(self) -> None:
+        """v1.3.0: 自动清理过期历史文件（仅循环导出模式调用）。
+
+        删除文件名日期早于（今天 - clean_days）的 napcat_*_YYYY-MM-DD.jsonl；
+        手动归档（protected）过的目标文件不清理。
+        """
+        if not self.auto_clean:
+            return
+        cutoff = (datetime.now().date()
+                  - timedelta(days=self.clean_days)).strftime("%Y-%m-%d")
+        protected = set()
+        for g in self._state.get("protected", {}).get("group", []) or []:
+            protected.add(f"napcat_{g}_")
+        for u in self._state.get("protected", {}).get("private", []) or []:
+            protected.add(f"napcat_private_{u}_")
+        import re as _re
+        removed = 0
+        for f in self.export_dir.glob("napcat_*_????-??-??.jsonl"):
+            m = _re.match(
+                r"napcat_(private_)?(\d+)_(\d{4}-\d{2}-\d{2})\.jsonl$", f.name)
+            if not m:
+                continue
+            prefix = f"napcat_{m.group(1) or ''}{m.group(2)}_"
+            if prefix in protected:
+                continue  # 手动归档过的目标，不自动清理
+            fdate = m.group(3)
+            if fdate < cutoff:
+                try:
+                    f.unlink(missing_ok=True)
+                    logger.info(f"[NapCatExporter] 自动清理过期文件: "
+                                f"{f.name}（早于 {cutoff}）")
+                    removed += 1
+                except Exception as e:
+                    logger.error(f"[NapCatExporter] 清理文件失败 {f.name}: {e}")
+        if removed:
+            logger.info(f"[NapCatExporter] 本轮自动清理 {removed} 个过期文件")
+
     async def _auto_loop(self) -> None:
         logger.info(f"定时导出循环已启动，间隔 {self.interval}s，"
-                    f"导出目录: {self.export_dir.resolve()}")
+                    f"导出目录: {self.export_dir.resolve()}"
+                    + (f"，白名单: {self.whitelist}" if self.whitelist else "")
+                    + (f"，自动清理: {self.clean_days}天前"
+                       if self.auto_clean else "，自动清理: 关闭"))
         while True:
             try:
                 await self._auto_export_once()
             except Exception as e:
                 logger.error(f"定时导出异常: {e}")
+            try:
+                self._cleanup_old_files()
+            except Exception as e:
+                logger.error(f"自动清理异常: {e}")
             await asyncio.sleep(self.interval)
 
     # ---------------------------------------------------------------
@@ -463,6 +544,13 @@ class NapcatHistoryExporter(Star):
             return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
         count = max(1, min(int(count), 5000))
         written = await self._export_target("group", gid, limit=count)
+        if written > 0:
+            # v1.3.0: 手动归档过的目标加入保护名单，自动清理不删除其文件
+            self._state.setdefault("protected", {}).setdefault("group", [])
+            if gid not in self._state["protected"]["group"]:
+                self._state["protected"]["group"].append(gid)
+                self._save_state()
+                logger.info(f"[NapCatExporter] 群 {gid} 已加入手动归档保护名单")
         path = self.export_dir
         return (f"✅ 群 {gid} 导出完成：新增 {written} 条"
                 f"（导出目录: {path}）")
@@ -487,6 +575,13 @@ class NapcatHistoryExporter(Star):
             return f"❌ QQ 号格式错误：{user_id}。应为纯数字。"
         count = max(1, min(int(count), 5000))
         written = await self._export_target("private", uid, limit=count)
+        if written > 0:
+            # v1.3.0: 手动归档过的目标加入保护名单，自动清理不删除其文件
+            self._state.setdefault("protected", {}).setdefault("private", [])
+            if uid not in self._state["protected"]["private"]:
+                self._state["protected"]["private"].append(uid)
+                self._save_state()
+                logger.info(f"[NapCatExporter] 私聊 {uid} 已加入手动归档保护名单")
         return (f"✅ 与 {uid} 的私聊导出完成：新增 {written} 条"
                 f"（导出目录: {self.export_dir}）")
 
@@ -500,7 +595,8 @@ class NapcatHistoryExporter(Star):
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        written = await self._auto_export_once()
+        # v1.3.0: 手动触发全量增量 = 手动归档，不受白名单/当天限制
+        written = await self._auto_export_once(apply_rules=False)
         return f"✅ 全量增量导出完成，本轮新增 {written} 条（目录: {self.export_dir}）"
 
     @filter.llm_tool("get_export_status")
