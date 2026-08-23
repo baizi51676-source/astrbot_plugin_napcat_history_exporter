@@ -206,15 +206,32 @@ class NapcatHistoryExporter(Star):
         except Exception as e:
             logger.error(f"[NapCatExporter] 单文件拆分迁移异常: {e}")
 
-    def _write_records(self, path: Path, records: list, expect: int = 0) -> None:
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                for r in records:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.error(f"[NapCatExporter] 写入文件失败: {path} - {e}",
-                         exc_info=True)
-            raise
+    def _merge_write(self, path: Path, records: list) -> int:
+        """v1.3.3: 合并写入——读现有文件行 + 新记录，按 seq 去重、
+        按 t 排序后整体重写。文件自愈：不依赖内存去重，永不重复、有序。"""
+        merged: dict = {}
+        if path.exists():
+            for ln in path.read_text(encoding="utf-8",
+                                     errors="replace").splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    r = json.loads(ln)
+                    key = str(r.get("seq") or
+                              (r.get("user_id", "") + r.get("t", "")))
+                    merged[key] = r
+                except Exception:
+                    continue
+        for r in records:
+            key = str(r.get("seq") or
+                      (r.get("user_id", "") + r.get("t", "")))
+            merged[key] = r  # 新记录覆盖旧记录
+        ordered = sorted(merged.values(),
+                         key=lambda r: str(r.get("t", "")))
+        with open(path, "w", encoding="utf-8") as f:
+            for r in ordered:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return len(ordered)
 
     async def _fetch(self, action: str, key: str, target_id: str,
                      start_seq: int, count: int) -> list:
@@ -327,6 +344,7 @@ class NapcatHistoryExporter(Star):
         start = 0
         fetched: list = []
         guard = 0
+        local_seen = set(seen)  # v1.3.3: 本轮已收集 id，防页间重叠
         while True:
             guard += 1
             if guard > 100:  # 防御：单次最多翻 100 页
@@ -337,8 +355,10 @@ class NapcatHistoryExporter(Star):
                 break
             if limit > 0:
                 # 按需导出：收集未写过的消息，达到 limit 条为止
-                fresh = [m for m in msgs if self._mid_of(m) not in seen]
+                fresh = [m for m in msgs
+                         if self._mid_of(m) not in local_seen]
                 fetched.extend(fresh)
+                local_seen.update(self._mid_of(m) for m in fresh)
                 if len(fetched) >= limit:
                     break
                 # 本页没有新消息且包含旧消息 → 没有更多可导出的了
@@ -348,12 +368,13 @@ class NapcatHistoryExporter(Star):
                 # 增量：只保留 time > last_t 且未写过的消息
                 fresh = [m for m in msgs
                          if self._time_of(m) > last_t
-                         and self._mid_of(m) not in seen]
+                         and self._mid_of(m) not in local_seen]
                 if today_only:
                     # 循环导出只归档当天
                     fresh = [m for m in fresh
                              if self._time_of(m) >= today_start]
                 fetched.extend(fresh)
+                local_seen.update(self._mid_of(m) for m in fresh)
                 if today_only:
                     # 遇当天之前（含昨天及更早）的消息 → 本页已到当天边界
                     if any(self._time_of(m) < today_start for m in msgs):
@@ -371,7 +392,7 @@ class NapcatHistoryExporter(Star):
         # 按 time 排序
         new = sorted(fetched[:limit] if limit > 0 else fetched,
                      key=self._time_of)
-        # 按天分文件追加
+        # 按天分文件写入（v1.3.3: 统一合并-去重-排序-重写，文件自愈）
         written = 0
         by_date: dict = {}
         for m in new:
@@ -379,7 +400,7 @@ class NapcatHistoryExporter(Star):
         for date, msgs in by_date.items():
             path = self._target_path(chat, target_id, date)
             records = [self._fmt_record(m, chat, target_id) for m in msgs]
-            self._write_records(path, records, expect=len(records))
+            self._merge_write(path, records)
             written += len(records)
         # 更新游标：time 边界 + 最近 5000 个已写 message_id
         max_t = max(self._time_of(m) for m in new)
