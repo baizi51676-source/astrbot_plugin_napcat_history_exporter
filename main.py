@@ -143,10 +143,23 @@ class NapcatHistoryExporter(Star):
             return self.export_dir / f"napcat_{target_id}_{date}.jsonl"
         return self.export_dir / f"napcat_private_{target_id}_{date}.jsonl"
 
-    def _write_records(self, path: Path, records: list) -> None:
-        with open(path, "a", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    def _write_records(self, path: Path, records: list, expect: int = 0) -> None:
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            # 写后验证
+            real = path.resolve()
+            try:
+                size = real.stat().st_size
+            except Exception:
+                size = -1
+            logger.info(f"[NapCatExporter] 写入文件成功: {real}"
+                        f"（{len(records)}条, 文件大小 {size} 字节）")
+        except Exception as e:
+            logger.error(f"[NapCatExporter] 写入文件失败: {path.resolve()} - {e}",
+                         exc_info=True)
+            raise
 
     async def _fetch(self, action: str, key: str, target_id: str,
                      start_seq: int, count: int) -> list:
@@ -205,51 +218,87 @@ class NapcatHistoryExporter(Star):
     def _seq_of(msg: dict) -> int:
         return msg.get("message_seq") or msg.get("message_id") or 0
 
+    @staticmethod
+    def _mid_of(msg: dict) -> str:
+        """消息唯一 ID（用于去重）。"""
+        return str(msg.get("message_id") or msg.get("message_seq") or "")
+
+    @staticmethod
+    def _time_of(msg: dict) -> int:
+        try:
+            return int(msg.get("time") or 0)
+        except Exception:
+            return 0
+
     async def _export_target(self, chat: str, target_id: str,
                              limit: int = 0) -> int:
         """导出单个目标。
 
-        limit > 0：按需导出最近 limit 条（覆盖式快照，同时更新游标）；
-        limit = 0：增量导出（从上次游标续拉新消息）。
+        limit > 0：按需导出最近 limit 条（去重追加，同时更新游标）；
+        limit = 0：增量导出（以 time 时间戳为边界 + message_id 去重）。
         返回本次新增写入的条数。
+
+        注意：NapCat 返回的 message_seq = message_id（全局消息 ID），
+        并非单调递增，不能用作增量游标；因此使用 time 做边界，
+        并用已写 message_id 集合做去重（避免同秒消息重复/遗漏）。
         """
         action = "get_group_msg_history" if chat == "group" \
             else "get_friend_msg_history"
         key = "group_id" if chat == "group" else "user_id"
-        last_seq = self._state.get(chat, {}).get(target_id, 0)
-        # NapCat 扩展 API：message_seq=0 表示从最新消息开始。
-        # 因此无论按需还是增量，都从最新往回翻页；
-        # 增量模式过滤 seq > last_seq 的新消息，遇到含旧消息的页即停止。
+        # 游标结构: {"t": 最后导出消息的time, "ids": [已写message_id, 最多5000]}
+        st = self._state.get(chat, {}).get(target_id)
+        if isinstance(st, dict):
+            last_t = int(st.get("t") or 0)
+            seen = set(st.get("ids") or [])
+        else:
+            if st:  # 旧格式 int 游标（message_id 不单调，不可用）
+                logger.info(f"[NapCatExporter] {target_id} 检测到旧格式游标 "
+                            f"{st!r}（message_id 不单调，已重置为 0，将全量补导）")
+            last_t = 0
+            seen = set()
+        # NapCat 扩展 API：message_seq=0 表示从最新消息开始，只能往回翻页
         start = 0
         fetched: list = []
         guard = 0
         while True:
             guard += 1
             if guard > 100:  # 防御：单次最多翻 100 页
+                logger.warning(f"[NapCatExporter] {target_id} 翻页超过 100 页，强制停止")
                 break
             msgs = await self._fetch(action, key, target_id, start, self.batch)
             if not msgs:
                 break
             if limit > 0:
-                fetched.extend(msgs)
+                # 按需导出：收集未写过的消息，达到 limit 条为止
+                fresh = [m for m in msgs if self._mid_of(m) not in seen]
+                fetched.extend(fresh)
                 if len(fetched) >= limit:
                     break
+                # 本页没有新消息且包含旧消息 → 没有更多可导出的了
+                if not fresh and any(self._time_of(m) <= last_t for m in msgs):
+                    break
             else:
-                # 增量：只保留比游标新的消息
-                fresh = [m for m in msgs if self._seq_of(m) > last_seq]
+                # 增量：只保留 time > last_t 且未写过的消息
+                fresh = [m for m in msgs
+                         if self._time_of(m) > last_t
+                         and self._mid_of(m) not in seen]
                 fetched.extend(fresh)
-                if len(fresh) < len(msgs):
-                    break  # 本页已含游标或更早消息，说明新消息已全部取到
-            # 向前翻页（拿更早的）
+                # 本页出现 time <= last_t 的消息 → 已到导出边界，停止
+                if any(self._time_of(m) <= last_t for m in msgs):
+                    logger.info(f"[NapCatExporter] {target_id} 第{guard}页到达边界 "
+                                f"(页内{len(msgs)}条, fresh {len(fresh)}条)")
+                    break
+            # 向前翻页（拿更早的）：用最小 message_seq-1 定位
             start = min(self._seq_of(m) for m in msgs) - 1
             if start < 1 or len(fetched) >= 5000:
                 break
         if not fetched:
+            logger.info(f"[NapCatExporter] {target_id} 无新消息"
+                        f"（游标 t={last_t}，本轮 fetched=0）")
             return 0
-        if limit > 0:
-            new = sorted(fetched[:limit], key=self._seq_of)
-        else:
-            new = sorted(fetched, key=self._seq_of)
+        # 按 time 排序
+        new = sorted(fetched[:limit] if limit > 0 else fetched,
+                     key=self._time_of)
         # 按天分文件追加
         written = 0
         by_date: dict = {}
@@ -258,13 +307,16 @@ class NapcatHistoryExporter(Star):
         for date, msgs in by_date.items():
             path = self._target_path(chat, target_id, date)
             records = [self._fmt_record(m, chat, target_id) for m in msgs]
-            self._write_records(path, records)
+            self._write_records(path, records, expect=len(records))
             written += len(records)
-        # 更新游标
-        max_seq = max(self._seq_of(m) for m in new)
+        logger.info(f"[NapCatExporter] {target_id} 写入 {written} 条"
+                    f"（文件: {self.export_dir.resolve()}）")
+        # 更新游标：time 边界 + 最近 5000 个已写 message_id
+        max_t = max(self._time_of(m) for m in new)
+        new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
+        seen |= set(new_ids)
         cur = self._state.setdefault(chat, {})
-        if max_seq > cur.get(target_id, 0):
-            cur[target_id] = max_seq
+        cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
         self._save_state()
         return written
 
@@ -328,6 +380,13 @@ class NapcatHistoryExporter(Star):
     # ---------------------------------------------------------------
 
     async def initialize(self) -> None:
+        # 启动时打印关键路径，便于核对写入/统计目录是否一致
+        import os as _os
+        logger.info(f"[NapCatExporter] 进程 CWD: {_os.getcwd()}")
+        logger.info(f"[NapCatExporter] export_dir(配置): {self.export_dir!r}")
+        logger.info(f"[NapCatExporter] export_dir(绝对): {self.export_dir.resolve()}")
+        logger.info(f"[NapCatExporter] state_file: {self.state_file.resolve()}")
+        logger.info(f"[NapCatExporter] 当前游标: {json.dumps(self._state, ensure_ascii=False)}")
         if self.mode == "auto":
             self._task = asyncio.create_task(self._auto_loop())
             logger.info("NapCat 历史导出器已启动定时模式（每 %ss 增量导出一次，"
@@ -436,10 +495,41 @@ class NapcatHistoryExporter(Star):
             resp = await client.call_action(
                 "get_group_msg_history", group_id=gid,
                 message_seq="0", count=5)
+            # 第二页：从第一页最小 message_seq-1 往回翻，验证序列单调性
+            page1 = None
+            if isinstance(resp, dict):
+                page1 = resp.get("messages")
+            elif isinstance(resp, list):
+                page1 = resp
+            resp2 = None
+            if page1:
+                seqs = [int(m.get("message_seq") or 0) for m in page1 if isinstance(m, dict)]
+                if seqs:
+                    nxt = min(seqs) - 1
+                    if nxt >= 1:
+                        resp2 = await client.call_action(
+                            "get_group_msg_history", group_id=gid,
+                            message_seq=str(nxt), count=5)
         except Exception as e:
             return f"❌ 调用 get_group_msg_history 异常: {e}"
         s = json.dumps(resp, ensure_ascii=False)[:1500]
-        return f"get_group_msg_history({gid}) 原始响应:\n{s}"
+        out = [f"get_group_msg_history({gid}) 原始响应:\n{s}"]
+        # 单调性分析
+        def brief(msgs, tag):
+            if not msgs:
+                return f"{tag}: (空)"
+            lines = []
+            for m in msgs[:5]:
+                if isinstance(m, dict):
+                    lines.append(f"  seq={m.get('message_seq')} id={m.get('message_id')} "
+                                 f"time={m.get('time')} type={m.get('message_type')}")
+            return f"{tag}（{len(msgs)}条）:\n" + "\n".join(lines)
+        out.append(brief(page1, "第1页(最新)"))
+        if isinstance(resp2, dict):
+            out.append(brief(resp2.get("messages"), "第2页(更早)"))
+        elif isinstance(resp2, list):
+            out.append(brief(resp2, "第2页(更早)"))
+        return "\n".join(out)
 
     @filter.llm_tool("get_export_status")
     async def get_export_status(self, event: AstrMessageEvent):
@@ -477,6 +567,10 @@ class NapcatHistoryExporter(Star):
         for chat in ("group", "private"):
             st = self._state.get(chat, {})
             if st:
+                def _fmt(v):
+                    if isinstance(v, dict):
+                        return f"t={v.get('t')}(ids={len(v.get('ids') or [])})"
+                    return f"旧格式seq={v}"
                 lines.append(f"{chat}: " + ", ".join(
-                    f"{k}@seq{v}" for k, v in list(st.items())[:10]))
+                    f"{k}@{_fmt(v)}" for k, v in list(st.items())[:10]))
         return "\n".join(lines)
