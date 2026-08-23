@@ -40,7 +40,7 @@ class NapcatHistoryExporter(Star):
         self.export_dir = Path(config.get(
             "export_dir", "data/workspaces/napcat_exports"))
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        self._migrate_legacy_files()  # v1.1.0: 旧按天文件合并为单文件
+        self._split_merged_files()  # v1.2.0: v1.1.0 单文件自动拆回按天文件
         self.mode = str(config.get("mode", "auto"))
         self.interval = max(30, int(config.get("interval_seconds", 120)))
         self.batch = max(1, min(int(config.get("count_per_batch", 50)), 200))
@@ -140,72 +140,70 @@ class NapcatHistoryExporter(Star):
             return "unknown"
 
     def _target_path(self, chat: str, target_id: str, date: str) -> Path:
-        # v1.1.0: 每目标只保留一个文件（跨天合并），不再按天分文件
+        # 按天分文件：napcat_<群号>_YYYY-MM-DD.jsonl（私聊 napcat_private_<QQ>_*）
         if chat == "group":
-            return self.export_dir / f"napcat_{target_id}.jsonl"
-        return self.export_dir / f"napcat_private_{target_id}.jsonl"
+            return self.export_dir / f"napcat_{target_id}_{date}.jsonl"
+        return self.export_dir / f"napcat_private_{target_id}_{date}.jsonl"
 
-    def _migrate_legacy_files(self) -> None:
-        """v1.1.0 迁移：旧格式 napcat_<群>_YYYY-MM-DD.jsonl → 合并为单文件。
-
-        将同一目标的所有旧按天文件按时间排序合并写入
-        napcat_<群>.jsonl / napcat_private_<uid>.jsonl，随后删除旧文件。
+    def _split_merged_files(self) -> None:
+        """v1.2.0 迁移：若存在 v1.1.0 单文件 napcat_<群号>.jsonl，
+        按行内 t 字段拆回按天文件 napcat_<群号>_YYYY-MM-DD.jsonl，
+        随后删除单文件（避免与按天分文件模式冲突）。
         """
         try:
             if not self.export_dir.is_dir():
                 return
-            groups: dict = {}  # 目标文件名 → 行列表
             import re as _re
-            for p in sorted(self.export_dir.glob("napcat_*_????-??-??.jsonl")):
-                m = _re.match(
-                    r"napcat_(private_)?(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$", p.name)
-                if not m:
+            for p in sorted(self.export_dir.glob("napcat_*.jsonl")):
+                if p.name == "state.json":
                     continue
-                target = f"napcat_{m.group(1) or ''}{m.group(2)}.jsonl"
+                m = _re.match(r"napcat_(private_)?(\d+)\.jsonl$", p.name)
+                if not m:
+                    continue  # 已是按天文件，跳过
+                prefix = m.group(1) or ""
+                gid = m.group(2)
                 try:
                     lines = [ln for ln in
                              p.read_text(encoding="utf-8", errors="replace")
                              .splitlines() if ln.strip()]
                 except Exception as e:
-                    logger.error(f"[NapCatExporter] 迁移读取失败 {p.name}: {e}")
+                    logger.error(f"[NapCatExporter] 拆分读取失败 {p.name}: {e}")
                     continue
-                if lines:
-                    groups.setdefault(target, []).extend(lines)
+                if not lines:
+                    p.unlink(missing_ok=True)
+                    continue
+                # 按行内 t 字段的前 10 位（YYYY-MM-DD）分组
+                by_date: dict = {}
+                for ln in lines:
+                    d = ""
+                    try:
+                        d = str(json.loads(ln).get("t", ""))[:10]
+                    except Exception:
+                        pass
+                    by_date.setdefault(d or "unknown", []).append(ln)
+                for date, day_lines in by_date.items():
+                    target = self.export_dir / \
+                        f"napcat_{prefix}{gid}_{date}.jsonl"
+                    try:
+                        with open(target, "a", encoding="utf-8") as f:
+                            f.write("\n".join(day_lines) + "\n")
+                        logger.info(f"[NapCatExporter] 拆分: {p.name} → "
+                                    f"{target.name}（{len(day_lines)}行）")
+                    except Exception as e:
+                        logger.error(f"[NapCatExporter] 拆分写入失败 "
+                                     f"{target.name}: {e}")
                 p.unlink(missing_ok=True)
-                logger.info(f"[NapCatExporter] 迁移: {p.name} → {target}"
-                            f"（{len(lines)}行，旧文件已删除）")
-            for target, lines in groups.items():
-                # 按行内 t 字段排序（消息时间），保证合并后有序
-                try:
-                    lines.sort(key=lambda ln: json.loads(ln).get("t", ""))
-                except Exception:
-                    pass
-                path = self.export_dir / target
-                try:
-                    with open(path, "a", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                    logger.info(f"[NapCatExporter] 合并完成: {target}"
-                                f"（共{len(lines)}行）")
-                except Exception as e:
-                    logger.error(f"[NapCatExporter] 合并写入失败 {target}: {e}")
+                logger.info(f"[NapCatExporter] 单文件已删除: {p.name}")
         except Exception as e:
-            logger.error(f"[NapCatExporter] 旧文件迁移异常: {e}")
+            logger.error(f"[NapCatExporter] 单文件拆分迁移异常: {e}")
 
     def _write_records(self, path: Path, records: list, expect: int = 0) -> None:
         try:
             with open(path, "a", encoding="utf-8") as f:
                 for r in records:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            # 写后验证
-            real = path.resolve()
-            try:
-                size = real.stat().st_size
-            except Exception:
-                size = -1
-            logger.info(f"[NapCatExporter] 写入文件成功: {real}"
-                        f"（{len(records)}条, 文件大小 {size} 字节）")
         except Exception as e:
-            logger.error(f"[NapCatExporter] 写入文件失败: {path.resolve()} - {e}",
+            logger.error(f"[NapCatExporter] 写入文件失败: {path} - {e}",
                          exc_info=True)
             raise
 
@@ -333,16 +331,12 @@ class NapcatHistoryExporter(Star):
                 fetched.extend(fresh)
                 # 本页出现 time <= last_t 的消息 → 已到导出边界，停止
                 if any(self._time_of(m) <= last_t for m in msgs):
-                    logger.info(f"[NapCatExporter] {target_id} 第{guard}页到达边界 "
-                                f"(页内{len(msgs)}条, fresh {len(fresh)}条)")
                     break
             # 向前翻页（拿更早的）：用最小 message_seq-1 定位
             start = min(self._seq_of(m) for m in msgs) - 1
             if start < 1 or len(fetched) >= 5000:
                 break
         if not fetched:
-            logger.info(f"[NapCatExporter] {target_id} 无新消息"
-                        f"（游标 t={last_t}，本轮 fetched=0）")
             return 0
         # 按 time 排序
         new = sorted(fetched[:limit] if limit > 0 else fetched,
@@ -357,8 +351,6 @@ class NapcatHistoryExporter(Star):
             records = [self._fmt_record(m, chat, target_id) for m in msgs]
             self._write_records(path, records, expect=len(records))
             written += len(records)
-        logger.info(f"[NapCatExporter] {target_id} 写入 {written} 条"
-                    f"（文件: {self.export_dir.resolve()}）")
         # 更新游标：time 边界 + 最近 5000 个已写 message_id
         max_t = max(self._time_of(m) for m in new)
         new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
@@ -428,13 +420,6 @@ class NapcatHistoryExporter(Star):
     # ---------------------------------------------------------------
 
     async def initialize(self) -> None:
-        # 启动时打印关键路径，便于核对写入/统计目录是否一致
-        import os as _os
-        logger.info(f"[NapCatExporter] 进程 CWD: {_os.getcwd()}")
-        logger.info(f"[NapCatExporter] export_dir(配置): {self.export_dir!r}")
-        logger.info(f"[NapCatExporter] export_dir(绝对): {self.export_dir.resolve()}")
-        logger.info(f"[NapCatExporter] state_file: {self.state_file.resolve()}")
-        logger.info(f"[NapCatExporter] 当前游标: {json.dumps(self._state, ensure_ascii=False)}")
         if self.mode == "auto":
             self._task = asyncio.create_task(self._auto_loop())
             logger.info("NapCat 历史导出器已启动定时模式（每 %ss 增量导出一次，"
@@ -517,67 +502,6 @@ class NapcatHistoryExporter(Star):
             return "❌ 无权限：仅管理员可以使用此工具。"
         written = await self._auto_export_once()
         return f"✅ 全量增量导出完成，本轮新增 {written} 条（目录: {self.export_dir}）"
-
-    @filter.llm_tool("debug_group_history_api")
-    async def debug_group_history_api(self, event: AstrMessageEvent,
-                                      group_id: str):
-        '''
-        诊断工具：直接调用 NapCat get_group_msg_history 接口并返回原始响应。
-        用于排查"定时导出 0 条/无文件"问题——可以看到 NapCat 到底返回了什么
-        （retcode、message、消息数量等）。
-
-        Args:
-          group_id(string): 目标 QQ 群号（纯数字，必填）
-
-        返回: NapCat 原始响应 JSON（截断 1500 字符）
-        '''
-        if not self._is_allowed(event):
-            return "❌ 无权限：仅管理员可以使用此工具。"
-        gid = group_id.strip()
-        if not gid.isdigit():
-            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
-        client = self._get_client()
-        if client is None:
-            return "❌ 未获取到 aiocqhttp 客户端，请检查适配器配置。"
-        try:
-            resp = await client.call_action(
-                "get_group_msg_history", group_id=gid,
-                message_seq="0", count=5)
-            # 第二页：从第一页最小 message_seq-1 往回翻，验证序列单调性
-            page1 = None
-            if isinstance(resp, dict):
-                page1 = resp.get("messages")
-            elif isinstance(resp, list):
-                page1 = resp
-            resp2 = None
-            if page1:
-                seqs = [int(m.get("message_seq") or 0) for m in page1 if isinstance(m, dict)]
-                if seqs:
-                    nxt = min(seqs) - 1
-                    if nxt >= 1:
-                        resp2 = await client.call_action(
-                            "get_group_msg_history", group_id=gid,
-                            message_seq=str(nxt), count=5)
-        except Exception as e:
-            return f"❌ 调用 get_group_msg_history 异常: {e}"
-        s = json.dumps(resp, ensure_ascii=False)[:1500]
-        out = [f"get_group_msg_history({gid}) 原始响应:\n{s}"]
-        # 单调性分析
-        def brief(msgs, tag):
-            if not msgs:
-                return f"{tag}: (空)"
-            lines = []
-            for m in msgs[:5]:
-                if isinstance(m, dict):
-                    lines.append(f"  seq={m.get('message_seq')} id={m.get('message_id')} "
-                                 f"time={m.get('time')} type={m.get('message_type')}")
-            return f"{tag}（{len(msgs)}条）:\n" + "\n".join(lines)
-        out.append(brief(page1, "第1页(最新)"))
-        if isinstance(resp2, dict):
-            out.append(brief(resp2.get("messages"), "第2页(更早)"))
-        elif isinstance(resp2, list):
-            out.append(brief(resp2, "第2页(更早)"))
-        return "\n".join(out)
 
     @filter.llm_tool("get_export_status")
     async def get_export_status(self, event: AstrMessageEvent):
