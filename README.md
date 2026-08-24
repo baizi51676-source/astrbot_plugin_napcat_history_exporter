@@ -1,6 +1,12 @@
 # NapCat 历史记录导出器 (astrbot_plugin_napcat_history_exporter)
 
-通过 NapCat（OneBot v11）扩展 API 将历史聊天记录导出为 **JSONL 文件**，图片/表情/语音等媒体**不导出**，统一使用 `[图片]` `[表情]` 等**占位符**替换。适合做聊天记录存档、供其他插件（如 `astrbot_plugin_group_forwarder_special`）搜索联动。
+通过 NapCat（OneBot v11）扩展 API 将历史聊天记录导出为 **JSONL 文件**，图片/表情/语音等媒体**不导出**，统一使用 `[图片]` `[表情]` 等**占位符**替换。适合做聊天记录存档、归档检索与离线分析。
+
+> ## ⚠️ 联动机制已移除（v1.4.0 起）
+>
+> 从 **v1.4.0** 开始，本插件**不再支持任何联动机制**，不再与 `astrbot_plugin_group_forwarder_special` 等外部插件联动搜索。跨对话查看消息、归档搜索、群列表已内置为本插件自身的 LLM 工具（`get_group_message_history` / `search_archived_messages` / `list_archived_groups`），直接调用即可。
+>
+> 注意：特殊版插件（`astrbot_plugin_group_forwarder_special`）的联动兼容性仅支持本插件 **v1.3.3** 及之前版本；使用 v1.4.0+ 时两者不再互通。
 
 ## 特性
 
@@ -11,7 +17,7 @@
 - 🧩 **媒体占位符**：图片 `[图片]`、表情 `[表情]`、语音 `[语音]`、视频 `[视频]`、引用 `[引用消息]`、@ `[At:QQ]`、文件 `[文件:名称]` 等
 - ⚡ **增量游标**：记录每个群/好友的最新时间戳，重复运行只追加新消息；文件自动去重排序，不会重复
 
-## 输出格式（供联动方解析）
+## 输出格式
 
 每行一条 JSON：
 
@@ -40,13 +46,12 @@
 | `search_archived_messages(group_id, keyword, date, user_id, nickname, count)` | 在归档记录中搜索（关键词/日期/QQ/昵称，可组合）|
 | `list_archived_groups()` | 列出已有归档记录的群号 |
 | `get_export_status()` | 查看自动归档开关、导出目录、游标状态 |
-| `get_export_status()` | 查看模式、导出目录、各群游标状态 |
 
 ## 配置（WebUI 可视化）
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `export_dir` | `data/workspaces/napcat_exports` | 导出目录（与日志归档插件同级，位于 AstrBot 工作目录的 `data/workspaces/` 下）|
+| `export_dir` | `data/workspaces/napcat_exports` | 导出目录（JSONL 文件与游标状态存放位置，位于 AstrBot 工作目录下）|
 | `auto_export` | `true` | 自动归档开关：开启后定时循环增量归档 |
 | `interval_seconds` | `120` | 定时循环间隔（最小 30s）|
 | `count_per_batch` | `50` | 单次 API 拉取条数（1-200）|
@@ -55,13 +60,6 @@
 | `whitelist` | `[]`（全部）| **自动归档群白名单**：仅名单内的群会被定时循环导出；留空=全部群。用户/LLM 手动归档不受此限制 |
 | `auto_clean` | `true` | **历史文件自动清理开关**：定时循环导出时自动删除超过保留天数的历史 JSONL（手动归档过的目标除外）|
 | `clean_days` | `14` | 历史文件保留天数（默认 14 天，更早的自动删除）|
-
-## 与特殊版插件联动搜索
-
-`astrbot_plugin_group_forwarder_special`（v1.2.0+）支持直接读取本插件导出的 `napcat_*.jsonl` 文件进行搜索：
-1. 安装并启用本插件（默认 auto 模式，每 120s 增量导出）
-2. 在特殊版插件配置中将 `log_dir` 指向本插件的 `export_dir`（或保持默认，两边一致即可）
-3. 特殊版即可按群号搜索本插件导出的历史消息（含 QQ UID 过滤）
 
 ## 使用前提
 
