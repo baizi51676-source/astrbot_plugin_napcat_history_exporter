@@ -5,11 +5,11 @@
     "default": "data/workspaces/napcat_exports",
     "hint": "相对 AstrBot 工作目录（如 /root/astrbot）。默认与日志归档插件的 workspaces 同级（data/workspaces/napcat_exports）。与特殊版插件（astrbot_plugin_group_forwarder_special）联动搜索时，在特殊版配置中把 export_dir 设成同一路径即可。"
   },
-  "mode": {
-    "description": "导出模式",
-    "type": "string",
-    "default": "auto",
-    "hint": "auto=定时循环增量导出（默认 120s 一次）；manual=仅被 LLM 工具/指令触发时导出。"
+  "auto_export": {
+    "description": "自动归档开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后定时循环增量归档（默认 120s 一次，仅归档当天消息，受群白名单限制）；关闭后仅在被 LLM 工具触发时归档。"
   },
   "interval_seconds": {
     "description": "定时循环间隔（秒）",

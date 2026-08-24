@@ -4,14 +4,12 @@
 
 ## 特性
 
-- 🕐 **两种模式**：
-  - `auto`（默认）：定时循环**增量导出**，每 120s 检查一次各群新消息，只拉新增部分，不重复写入
-  - `manual`：仅被 LLM 工具触发时导出
+- 🕐 **自动归档开关**（`auto_export`，默认开启）：开启后定时循环**增量导出**，每 120s 检查一次各群新消息；关闭后仅在被 LLM 工具触发时归档
 - 📄 **JSONL 格式**（每行一条消息），按天分文件：
   - 群聊：`napcat_<群号>_YYYY-MM-DD.jsonl`
   - 私聊：`napcat_private_<QQ号>_YYYY-MM-DD.jsonl`
 - 🧩 **媒体占位符**：图片 `[图片]`、表情 `[表情]`、语音 `[语音]`、视频 `[视频]`、引用 `[引用消息]`、@ `[At:QQ]`、文件 `[文件:名称]` 等
-- ⚡ **增量游标**：记录每个群/好友的最新 `message_seq`，重复运行只追加新消息
+- ⚡ **增量游标**：记录每个群/好友的最新时间戳，重复运行只追加新消息；文件自动去重排序，不会重复
 
 ## 输出格式（供联动方解析）
 
@@ -37,7 +35,11 @@
 |---|---|
 | `export_group_history(group_id, count)` | 按需导出指定群最近 N 条消息（默认 200，最大 5000）|
 | `export_private_history(user_id, count)` | 按需导出指定好友私聊最近 N 条消息 |
-| `export_all_incremental()` | 手动触发一轮全量增量导出（所有群 + 可选私聊）|
+| `export_all_incremental(group_id, start_date, end_date)` | 立即归档：默认全部群增量；可指定群号 + 起止日期回溯归档历史 |
+| `get_group_message_history(group_id, count)` | 读取指定群已归档记录（最近 N 条，时间正序）|
+| `search_archived_messages(group_id, keyword, date, user_id, nickname, count)` | 在归档记录中搜索（关键词/日期/QQ/昵称，可组合）|
+| `list_archived_groups()` | 列出已有归档记录的群号 |
+| `get_export_status()` | 查看自动归档开关、导出目录、游标状态 |
 | `get_export_status()` | 查看模式、导出目录、各群游标状态 |
 
 ## 配置（WebUI 可视化）
@@ -45,11 +47,11 @@
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `export_dir` | `data/workspaces/napcat_exports` | 导出目录（与日志归档插件同级，位于 AstrBot 工作目录的 `data/workspaces/` 下）|
-| `mode` | `auto` | `auto` 定时增量 / `manual` 按需触发 |
+| `auto_export` | `true` | 自动归档开关：开启后定时循环增量归档 |
 | `interval_seconds` | `120` | 定时循环间隔（最小 30s）|
 | `count_per_batch` | `50` | 单次 API 拉取条数（1-200）|
-| `auto_export_friends` | `false` | 定时模式是否同时导出私聊 |
-| `admin_only` | `true` | 仅管理员可调用导出工具（manual 模式始终仅管理员可用）|
+| `auto_export_friends` | `false` | 自动归档是否同时导出私聊 |
+| `admin_only` | `true` | 仅管理员可调用 LLM 工具 |
 | `whitelist` | `[]`（全部）| **自动归档群白名单**：仅名单内的群会被定时循环导出；留空=全部群。用户/LLM 手动归档不受此限制 |
 | `auto_clean` | `true` | **历史文件自动清理开关**：定时循环导出时自动删除超过保留天数的历史 JSONL（手动归档过的目标除外）|
 | `clean_days` | `14` | 历史文件保留天数（默认 14 天，更早的自动删除）|

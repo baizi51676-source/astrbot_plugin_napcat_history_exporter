@@ -28,7 +28,7 @@ class NapcatHistoryExporter(Star):
     astrbot_plugin_group_forwarder_special）搜索联动。
 
     特性：
-    - 两种模式：auto 定时循环增量导出（默认 120s 一次）/ manual 仅按需触发
+    - 自动归档开关（auto_export）：开启后定时循环增量导出（默认 120s 一次）
     - 图片、表情、语音等媒体不导出，使用 [图片]/[表情]/[语音] 等占位符
     - 按天分文件：napcat_<群号>_YYYY-MM-DD.jsonl（私聊 napcat_private_<QQ>_*.jsonl）
     - 增量导出：记录每个目标的最新 message_seq，只拉新消息，不重复写入
@@ -41,7 +41,7 @@ class NapcatHistoryExporter(Star):
             "export_dir", "data/workspaces/napcat_exports"))
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self._split_merged_files()  # v1.2.0: v1.1.0 单文件自动拆回按天文件
-        self.mode = str(config.get("mode", "auto"))
+        self.auto_export = bool(config.get("auto_export", True))
         self.interval = max(30, int(config.get("interval_seconds", 120)))
         self.batch = max(1, min(int(config.get("count_per_batch", 50)), 200))
         self.auto_friends = bool(config.get("auto_export_friends", False))
@@ -76,9 +76,6 @@ class NapcatHistoryExporter(Star):
             logger.error(f"保存导出状态失败: {e}")
 
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
-        # v1.3.0: manual 模式（手动触发）仅管理员可用
-        if self.mode == "manual":
-            return event.is_admin()
         if not self.admin_only:
             return True
         return event.is_admin()
@@ -321,12 +318,15 @@ class NapcatHistoryExporter(Star):
             return 0
 
     async def _export_target(self, chat: str, target_id: str,
-                             limit: int = 0, today_only: bool = False) -> int:
+                             limit: int = 0, today_only: bool = False,
+                             start_ts: int = 0, end_ts: int = 0) -> int:
         """导出单个目标。
 
         limit > 0：按需导出最近 limit 条（去重追加，同时更新游标）；
         limit = 0：增量导出（以 time 时间戳为边界 + message_id 去重）。
-        today_only=True（循环导出模式）：只归档当天消息，不导历史。
+        today_only=True（自动归档）：只归档当天消息，不导历史。
+        start_ts/end_ts > 0：回溯导出 [start_ts, end_ts] 时间段消息
+        （手动归档，不推进游标，不影响后续增量）。
         返回本次新增写入的条数。
 
         注意：NapCat 返回的 message_seq = message_id（全局消息 ID），
@@ -377,31 +377,55 @@ class NapcatHistoryExporter(Star):
                 # 本页没有新消息且包含旧消息 → 没有更多可导出的了
                 if not fresh and any(self._time_of(m) <= last_t for m in msgs):
                     break
-            else:
-                # 增量：只保留 time > last_t 且未写过的消息
-                fresh = [m for m in msgs
-                         if self._time_of(m) > last_t
-                         and self._mid_of(m) not in local_seen]
-                if today_only:
-                    # 循环导出只归档当天
-                    fresh = [m for m in fresh
-                             if self._time_of(m) >= today_start]
-                fetched.extend(fresh)
-                local_seen.update(self._mid_of(m) for m in fresh)
-                if today_only:
-                    # 遇当天之前（含昨天及更早）的消息 → 本页已到当天边界
-                    if any(self._time_of(m) < today_start for m in msgs):
+                if not fresh:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
                         break
                 else:
-                    if any(self._time_of(m) <= last_t for m in msgs):
-                        break
-            # v1.3.4: 连续 3 页无新增 → 翻页无新消息（或锚点定位失败死循环），停止
-            if not fresh:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
+                    consecutive_empty = 0
             else:
-                consecutive_empty = 0
+                # 回溯时间段导出（手动归档历史，不推进游标）
+                if start_ts > 0:
+                    zone = [m for m in msgs
+                            if end_ts <= 0 or self._time_of(m) <= end_ts]
+                    fresh = [m for m in zone
+                             if self._time_of(m) >= start_ts
+                             and self._mid_of(m) not in local_seen]
+                    fetched.extend(fresh)
+                    local_seen.update(self._mid_of(m) for m in fresh)
+                    if any(self._time_of(m) < start_ts for m in msgs):
+                        break  # 已到时间段起点
+                    if zone and not fresh:
+                        consecutive_empty += 1
+                        if consecutive_empty >= 3:
+                            break
+                    elif zone and fresh:
+                        consecutive_empty = 0
+                    # zone 为空（页内全是 end_ts 之后的消息）→ 不计数，继续往前翻
+                else:
+                    # 增量：只保留 time > last_t 且未写过的消息
+                    fresh = [m for m in msgs
+                             if self._time_of(m) > last_t
+                             and self._mid_of(m) not in local_seen]
+                    if today_only:
+                        # 自动归档只归档当天
+                        fresh = [m for m in fresh
+                                 if self._time_of(m) >= today_start]
+                    fetched.extend(fresh)
+                    local_seen.update(self._mid_of(m) for m in fresh)
+                    if today_only:
+                        # 遇当天之前（含昨天及更早）的消息 → 本页已到当天边界
+                        if any(self._time_of(m) < today_start for m in msgs):
+                            break
+                    else:
+                        if any(self._time_of(m) <= last_t for m in msgs):
+                            break
+                    if not fresh:
+                        consecutive_empty += 1
+                        if consecutive_empty >= 3:
+                            break
+                    else:
+                        consecutive_empty = 0
             # 向前翻页（拿更早的）：v1.3.4 优先用 real_seq（单调递增，
             # 传 min-1 精确定位更早消息）；无 real_seq 时回退页内最小
             # message_id（真实存在，NapCat 返回其之前更早的消息）
@@ -439,6 +463,9 @@ class NapcatHistoryExporter(Star):
             # 翻页失败时也不漏"最新"消息，翻页可用时能补全当天更早的
             cur[target_id] = {"t": today_start - 1,
                               "ids": list(seen)[-5000:]}
+        elif start_ts > 0:
+            # v1.4.0: 回溯时间段归档不推进游标（不影响后续增量），仅更新去重 ids
+            cur[target_id] = {"t": last_t, "ids": list(seen)[-5000:]}
         else:
             cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
         self._save_state()
@@ -567,13 +594,13 @@ class NapcatHistoryExporter(Star):
     # ---------------------------------------------------------------
 
     async def initialize(self) -> None:
-        if self.mode == "auto":
+        if self.auto_export:
             self._task = asyncio.create_task(self._auto_loop())
-            logger.info("NapCat 历史导出器已启动定时模式（每 %ss 增量导出一次，"
+            logger.info("NapCat 历史导出器已启动自动归档（每 %ss 增量导出一次，"
                         "导出目录: %s）", self.interval, self.export_dir.resolve())
         else:
-            logger.info("NapCat 历史导出器当前为 manual 模式，"
-                        "仅在被 LLM 工具触发时导出（导出目录: %s）",
+            logger.info("NapCat 历史导出器自动归档已关闭，"
+                        "仅在被 LLM 工具触发时归档（导出目录: %s）",
                         self.export_dir.resolve())
 
     async def terminate(self) -> None:
@@ -652,18 +679,69 @@ class NapcatHistoryExporter(Star):
                 f"（导出目录: {self.export_dir}）")
 
     @filter.llm_tool("export_all_incremental")
-    async def export_all_incremental(self, event: AstrMessageEvent):
+    async def export_all_incremental(self, event: AstrMessageEvent,
+                                     group_id: str = "",
+                                     start_date: str = "",
+                                     end_date: str = ""):
         '''
-        手动触发一轮全量增量导出：所有群（及配置开启时的私聊）的新消息。
-        与定时模式行为一致，适合 manual 模式或想立即同步时调用。
+        立即归档（手动触发，不受自动归档开关/白名单/当天限制）：
+        默认增量归档全部群；可指定群号与时间段回溯归档历史消息。
 
-        返回: 本轮新增条数
+        Args:
+          group_id(string): 目标群号（可选，留空=全部群）
+          start_date(string): 开始日期 YYYY-MM-DD（可选，留空=不限起点）
+          end_date(string): 结束日期 YYYY-MM-DD（可选，留空=不限终点）
+
+        返回: 归档摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
-        # v1.3.0: 手动触发全量增量 = 手动归档，不受白名单/当天限制
-        written = await self._auto_export_once(apply_rules=False)
-        return f"✅ 全量增量导出完成，本轮新增 {written} 条（目录: {self.export_dir}）"
+        start_ts = 0
+        end_ts = 0
+        try:
+            if start_date:
+                start_ts = int(datetime.strptime(
+                    start_date.strip(), "%Y-%m-%d").timestamp())
+            if end_date:
+                end_ts = int(datetime.strptime(
+                    end_date.strip() + " 23:59:59",
+                    "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:
+            return ("❌ 日期格式错误：应为 YYYY-MM-DD，例如 2026-08-20。")
+        if start_ts and end_ts and start_ts > end_ts:
+            return "❌ 开始日期不能晚于结束日期。"
+        # 指定群
+        if group_id:
+            gid = group_id.strip()
+            if not gid.isdigit():
+                return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+            written = await self._export_target(
+                "group", gid, start_ts=start_ts, end_ts=end_ts)
+            return (f"✅ 群 {gid} 归档完成：新增 {written} 条"
+                    f"（导出目录: {self.export_dir}）")
+        # 全部群
+        client = self._get_client()
+        if client is None:
+            return "❌ 未获取到 aiocqhttp 客户端，请检查适配器配置。"
+        try:
+            groups = await client.call_action("get_group_list")
+        except Exception as e:
+            logger.error(f"获取群列表失败: {e}")
+            groups = []
+        total = 0
+        for g in groups or []:
+            gid = str(g.get("group_id", ""))
+            if not gid:
+                continue
+            try:
+                n = await self._export_target("group", gid,
+                                              start_ts=start_ts,
+                                              end_ts=end_ts)
+                total += n
+            except Exception as e:
+                logger.error(f"归档群 {gid} 失败: {e}")
+        return (f"✅ 全部群归档完成，新增 {total} 条"
+                f"（导出目录: {self.export_dir}）")
 
     @filter.llm_tool("get_export_status")
     async def get_export_status(self, event: AstrMessageEvent):
@@ -677,7 +755,8 @@ class NapcatHistoryExporter(Star):
         exp = self.export_dir.resolve()
         files = sorted(p.name for p in exp.glob("*.jsonl"))
         lines = [
-            f"模式: {self.mode}（定时间隔 {self.interval}s）",
+            f"自动归档: {'开启' if self.auto_export else '关闭'}"
+            f"（间隔 {self.interval}s）",
             f"导出目录(配置值): {self.export_dir!r}",
             f"导出目录(绝对路径): {exp}",
             f"state.json 路径: {self.state_file.resolve()}",
@@ -708,3 +787,160 @@ class NapcatHistoryExporter(Star):
                 lines.append(f"{chat}: " + ", ".join(
                     f"{k}@{_fmt(v)}" for k, v in list(st.items())[:10]))
         return "\n".join(lines)
+
+    # ---------------------------------------------------------------
+    # 归档读取（v1.4.0 整合自特殊版：查看/搜索/群列表）
+    # ---------------------------------------------------------------
+
+    def _read_group_files(self, group_id: str) -> list:
+        """返回某群全部归档文件路径（按文件名倒序 = 新 → 旧）。"""
+        gid = group_id.strip()
+        files = [p for p in self.export_dir.iterdir()
+                 if p.is_file()
+                 and (p.name.startswith(f"napcat_{gid}_")
+                      or p.name.startswith(f"napcat_{gid}."))]
+        files.sort(key=lambda p: p.name, reverse=True)
+        return files
+
+    def _parse_archived_line(self, raw: str) -> dict | None:
+        """解析 JSONL 归档行。"""
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            return None
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return None
+        return {
+            "t": d.get("t", ""),
+            "user_id": str(d.get("user_id", "") or ""),
+            "nickname": d.get("nickname", ""),
+            "content": d.get("content", ""),
+        }
+
+    @filter.llm_tool("get_group_message_history")
+    async def get_group_message_history(self, event: AstrMessageEvent,
+                                        group_id: str, count: int = 20):
+        '''
+        读取指定群已归档的聊天记录（跨天文件合并，按时间正序返回最近 N 条）。
+        适用于查看本插件导出的历史消息，无需依赖 LLM 推理。
+
+        Args:
+          group_id(string): 目标 QQ 群号（纯数字，必填）
+          count(number): 返回条数上限（默认 20，最大 200）
+
+        返回: 最近 N 条消息文本（时间正序）
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        gid = group_id.strip()
+        if not gid.isdigit():
+            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        count = max(1, min(int(count), 200))
+        files = self._read_group_files(gid)
+        if not files:
+            return f"📭 群 {gid} 暂无归档记录（目录: {self.export_dir}）"
+        all_msgs: list[dict] = []
+        for fpath in files:
+            try:
+                raw_lines = fpath.read_text(encoding="utf-8",
+                                            errors="replace").splitlines()
+            except Exception as e:
+                logger.error(f"读取归档文件失败 {fpath}: {e}")
+                continue
+            for raw in raw_lines:
+                info = self._parse_archived_line(raw)
+                if info:
+                    all_msgs.append(info)
+        all_msgs.sort(key=lambda m: m["t"])
+        recent = all_msgs[-count:]
+        lines = [f"[{m['t']}] {m['nickname']}: {m['content']}"
+                 for m in recent]
+        return (f"📋 群 {gid} 最近 {len(recent)} 条消息:\n"
+                + "\n".join(lines))
+
+    @filter.llm_tool("search_archived_messages")
+    async def search_archived_messages(self, event: AstrMessageEvent,
+                                       group_id: str, keyword: str = "",
+                                       date: str = "",
+                                       user_id: str = "",
+                                       nickname: str = "",
+                                       count: int = 20):
+        '''
+        在指定群已归档记录中搜索消息（纯程序过滤，不依赖 LLM 推理）。
+        条件可任意组合，全部满足才命中。
+
+        Args:
+          group_id(string): 目标 QQ 群号（纯数字，必填）
+          keyword(string): 消息内容关键词（子串匹配，不区分大小写，可选）
+          date(string): 日期过滤 YYYY-MM-DD（可选）
+          user_id(string): QQ 号精确匹配（可选）
+          nickname(string): 昵称包含该字符串（可选）
+          count(number): 返回条数上限（默认 20，最大 200）
+
+        返回: 命中的消息文本（时间正序）
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        gid = group_id.strip()
+        if not gid.isdigit():
+            return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
+        count = max(1, min(int(count), 200))
+        kw = keyword.strip() if keyword else None
+        dt = date.strip() if date else None
+        uid = user_id.strip() if user_id else None
+        nick = nickname.strip() if nickname else None
+        files = self._read_group_files(gid)
+        if not files:
+            return f"📭 群 {gid} 暂无归档记录（目录: {self.export_dir}）"
+        hits: list[dict] = []
+        for fpath in files:
+            try:
+                raw_lines = fpath.read_text(encoding="utf-8",
+                                            errors="replace").splitlines()
+            except Exception as e:
+                logger.error(f"读取归档文件失败 {fpath}: {e}")
+                continue
+            for raw in raw_lines:
+                info = self._parse_archived_line(raw)
+                if not info:
+                    continue
+                if dt and not str(info["t"]).startswith(dt):
+                    continue
+                if kw and kw.lower() not in info["content"].lower():
+                    continue
+                if uid and info["user_id"] != uid:
+                    continue
+                if nick and nick.lower() not in info["nickname"].lower():
+                    continue
+                hits.append(info)
+        hits.sort(key=lambda m: m["t"])
+        result = hits[-count:]
+        lines = [f"[{m['t']}] {m['nickname']}({m['user_id']}): {m['content']}"
+                 for m in result]
+        return (f"🔍 群 {gid} 搜索到 {len(hits)} 条"
+                f"（显示最近 {len(result)} 条）:\n" + "\n".join(lines))
+
+    @filter.llm_tool("list_archived_groups")
+    async def list_archived_groups(self, event: AstrMessageEvent):
+        '''
+        列出已有归档记录的群号列表（按文件名提取，去重排序）。
+
+        返回: 群号列表
+        '''
+        if not self._is_allowed(event):
+            return "❌ 无权限：仅管理员可以使用此工具。"
+        import re as _re
+        groups = set()
+        for p in self.export_dir.glob("napcat_*.jsonl"):
+            m = _re.match(r"napcat_(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$", p.name)
+            if m:
+                groups.add(m.group(1))
+                continue
+            m2 = _re.match(r"napcat_(\d+)\.jsonl$", p.name)
+            if m2:
+                groups.add(m2.group(1))
+        if not groups:
+            return "📭 暂无任何归档记录（目录: {})".format(self.export_dir)
+        lines = sorted(groups)
+        return "📂 已有归档的群:\n" + "\n".join(lines)
