@@ -297,6 +297,18 @@ class NapcatHistoryExporter(Star):
         return msg.get("message_seq") or msg.get("message_id") or 0
 
     @staticmethod
+    def _anchor_of(msg: dict) -> int | None:
+        """v1.3.4: 翻页定位锚点——优先 real_seq（会话内序号，单调递增，
+        NapCat 内部用其定位），否则回退 message_id。"""
+        rs = msg.get("real_seq")
+        if rs is not None:
+            try:
+                return int(str(rs).strip())
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
     def _mid_of(msg: dict) -> str:
         """消息唯一 ID（用于去重）。"""
         return str(msg.get("message_id") or msg.get("message_seq") or "")
@@ -345,6 +357,7 @@ class NapcatHistoryExporter(Star):
         fetched: list = []
         guard = 0
         local_seen = set(seen)  # v1.3.3: 本轮已收集 id，防页间重叠
+        consecutive_empty = 0  # v1.3.4: 连续无新增页数，防翻页死循环
         while True:
             guard += 1
             if guard > 100:  # 防御：单次最多翻 100 页
@@ -382,9 +395,22 @@ class NapcatHistoryExporter(Star):
                 else:
                     if any(self._time_of(m) <= last_t for m in msgs):
                         break
-            # 向前翻页（拿更早的）：v1.3.2 传页内最小 message_seq（真实存在的
-            # 消息 ID 作为锚点，NapCat 返回其之前更早的消息；不再 -1 以免锚点不存在）
-            start = min(self._seq_of(m) for m in msgs)
+            # v1.3.4: 连续 3 页无新增 → 翻页无新消息（或锚点定位失败死循环），停止
+            if not fresh:
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+            else:
+                consecutive_empty = 0
+            # 向前翻页（拿更早的）：v1.3.4 优先用 real_seq（单调递增，
+            # 传 min-1 精确定位更早消息）；无 real_seq 时回退页内最小
+            # message_id（真实存在，NapCat 返回其之前更早的消息）
+            anchors = [a for a in (self._anchor_of(m) for m in msgs)
+                       if a is not None]
+            if anchors:
+                start = min(anchors) - 1
+            else:
+                start = min(self._seq_of(m) for m in msgs)
             if start < 1 or len(fetched) >= 5000:
                 break
         if not fetched:
