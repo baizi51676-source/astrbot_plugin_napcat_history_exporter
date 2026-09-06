@@ -52,5 +52,17 @@
     "type": "int",
     "default": 14,
     "hint": "仅保留最近 N 天的历史文件，更早的自动删除（默认 14 天）。手动归档过的目标文件不清理。"
+  },
+  "archive_bots": {
+    "description": "多 bot 归档白名单（v1.5.0）",
+    "type": "list",
+    "default": [],
+    "hint": "一个 QQ 号 = 一个 aiocqhttp 平台实例。留空 = 归档全部 aiocqhttp 实例（默认）；填写一个或多个平台实例 id（WebUI 平台配置里自己起的 id）或登录 QQ 号，则只归档指定的 bot。例如 [\"123456789\", \"my_bot_2\"]。"
+  },
+  "backend": {
+    "description": "后端协议（v1.5.0）",
+    "type": "string",
+    "default": "auto",
+    "hint": "auto = 自动探测 NapCat/SnowLuma（默认，首次拉到消息后探测并打印日志）；napcat = 强制 NapCat；snowluma = 强制 SnowLuma。"
   }
 }
