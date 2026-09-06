@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,14 +22,15 @@ _SEG_PLACEHOLDER = {
 
 
 class NapcatHistoryExporter(Star):
-    """NapCat 历史聊天记录导出插件（OneBot v11 / aiocqhttp 适配）。
+    """NapCat / SnowLuma 历史聊天记录导出插件（OneBot v11 / aiocqhttp 适配）。
 
-    通过 NapCat 扩展 API（get_group_msg_history / get_friend_msg_history）
-    将历史聊天记录导出为 JSONL 文件（每行一条消息），供其他插件（如
-    astrbot_plugin_group_forwarder_special）搜索联动。
-
+    通过扩展 API（get_group_msg_history / get_friend_msg_history）
+    将历史聊天记录导出为 JSONL 文件（每行一条消息），供归档检索与离线分析；
+    v1.4.0 起不再与外部插件联动搜索（查看/搜索已内置为 LLM 工具）。
     特性：
     - 自动归档开关（auto_export）：开启后定时循环增量导出（默认 120s 一次）
+    - v1.5.0：多 bot（多 aiocqhttp 实例）独立归档，archive_bots 可选 bot；
+      后端 NapCat/SnowLuma 自动探测（backend: auto）
     - 图片、表情、语音等媒体不导出，使用 [图片]/[表情]/[语音] 等占位符
     - 按天分文件：napcat_<群号>_YYYY-MM-DD.jsonl（私聊 napcat_private_<QQ>_*.jsonl）
     - 增量导出：记录每个目标的最新 message_seq，只拉新消息，不重复写入
@@ -56,6 +58,13 @@ class NapcatHistoryExporter(Star):
         self._client = None
         self._task: asyncio.Task | None = None
         self._last_clean: datetime | None = None  # v1.3.1: 上次自动清理时间（每12h一次）
+        # v1.5.0: 多 bot / SnowLuma
+        self.archive_bots = [str(x).strip() for x in (config.get("archive_bots") or [])
+                             if str(x).strip()]  # 留空=归档全部 aiocqhttp 实例
+        self.backend_cfg = str(config.get("backend", "auto") or "auto").strip().lower()
+        self._backend: str | None = None      # 后端探测结果缓存: "napcat" / "snowluma"
+        self._qq_cache: dict = {}             # 平台实例 id -> 登录 QQ号（get_login_info）
+        self._qq_cache_ts: float = 0.0
 
     # ---------------------------------------------------------------
     # 内部工具
@@ -80,23 +89,142 @@ class NapcatHistoryExporter(Star):
             return True
         return event.is_admin()
 
-    def _get_client(self):
-        """获取 aiocqhttp 平台的 CQHttp 客户端（用于调用 NapCat 扩展 API）。"""
+    async def _get_client(self):
+        """获取 aiocqhttp 平台的 CQHttp 客户端（用于调用历史消息扩展 API）。
+
+        v1.5.0 起遍历全部 aiocqhttp 平台实例（旧版 get_platform 在多个实例时
+        只会返回第一个，已弃用）。单 bot 行为与旧版一致；多 bot 时返回第一个
+        “启用归档”的实例（事件链路请用 _client_for_event 按 self_id 精确路由）。
+        """
         if self._client is not None:
             return self._client
-        try:
-            platform = self.context.get_platform("aiocqhttp")
-            if platform is None:
-                logger.warning(
-                    "未找到 aiocqhttp 平台实例（get_platform('aiocqhttp') 返回 None），"
-                    "无法进行定时导出。请确认 AstrBot 已启用 aiocqhttp 适配器连接 NapCat。")
-                return None
-            self._client = platform.get_client()
-            logger.info("已获取 aiocqhttp 客户端（CQHttp），可用于调用 NapCat API")
-        except Exception as e:
-            logger.error(f"获取 aiocqhttp 客户端失败: {e}")
+        clients = await self._get_clients()
+        if not clients:
+            logger.warning(
+                "未找到可用的 aiocqhttp 平台实例，无法进行定时导出。"
+                "请确认 AstrBot 已启用 aiocqhttp 适配器连接 NapCat/SnowLuma。")
             return None
+        self._client = clients[0][2]
+        logger.info("已获取 aiocqhttp 客户端（CQHttp），可用于调用历史消息 API")
         return self._client
+
+    def _aiocqhttp_platforms(self) -> list:
+        """枚举全部 aiocqhttp 平台实例（v4 的 get_platform 已弃用且多实例时
+        只返回第一个匹配，因此直接读取 platform_manager.platform_insts）。"""
+        try:
+            mgr = getattr(self.context, "platform_manager", None)
+            insts = list(getattr(mgr, "platform_insts", None) or [])
+        except Exception:
+            insts = []
+        if not insts:
+            # 拿不到 platform_manager 的旧版 AstrBot：回退 get_platform
+            try:
+                p = self.context.get_platform("aiocqhttp")
+            except Exception:
+                p = None
+            return [p] if p is not None else []
+        out = []
+        for p in insts:
+            try:
+                if p.meta().name != "aiocqhttp":
+                    continue
+            except Exception:
+                continue
+            out.append(p)
+        return out
+
+    async def _bot_qq(self, client, pid: str) -> str:
+        """获取某平台实例的登录 QQ 号（self_id）；失败返回空串。结果缓存 600s。"""
+        now = time.time()
+        if now - self._qq_cache_ts > 600:
+            self._qq_cache = {}
+            self._qq_cache_ts = now
+        if pid in self._qq_cache:
+            return self._qq_cache[pid]
+        try:
+            info = await client.call_action("get_login_info")
+            qq = str((info or {}).get("user_id") or "")
+        except Exception:
+            qq = ""
+        self._qq_cache[pid] = qq
+        return qq
+
+    def _bot_enabled(self, pid: str, qq: str) -> bool:
+        """archive_bots 过滤：留空 = 全部实例都归档；
+        否则按平台实例 id（WebUI 平台配置的 id）或登录 QQ 号匹配。"""
+        if not self.archive_bots:
+            return True
+        return pid in self.archive_bots or (bool(qq) and qq in self.archive_bots)
+
+    async def _get_clients(self) -> list:
+        """返回 [(platform_id, qq, client)]：所有“启用归档”的 aiocqhttp 实例。"""
+        out = []
+        for p in self._aiocqhttp_platforms():
+            try:
+                pid = str(p.meta().id or "")
+                client = p.get_client()
+            except Exception:
+                continue
+            if client is None:
+                continue
+            qq = await self._bot_qq(client, pid)
+            if not self._bot_enabled(pid, qq):
+                logger.info(f"[NapCatExporter] bot 未启用归档"
+                            f"（archive_bots 过滤）: 实例id={pid or '?'} qq={qq or '未知'}")
+                continue
+            out.append((pid, qq, client))
+        return out
+
+    async def _client_for_event(self, event: AstrMessageEvent):
+        """按事件所属 bot（self_id=QQ 号）路由到对应实例。
+
+        返回 (client, platform_id, qq)；事件来自未被 archive_bots 启用的
+        bot、或找不到对应实例时返回 (None, "", "")。
+        """
+        clients = await self._get_clients()
+        if not clients:
+            return (None, "", "")
+        sid = None
+        try:
+            mobj = event.get_message_obj()
+            sid = getattr(mobj, "self_id", None)
+        except Exception:
+            pass
+        if sid:
+            sid = str(sid)
+            for pid, qq, client in clients:
+                if qq and qq == sid:
+                    return (client, pid, qq)
+            # 事件来自未启用归档的 bot
+            return (None, "", "")
+        # 旧适配器事件无 self_id：单实例返回唯一；多实例返回第一个
+        return (clients[0][2], clients[0][0], clients[0][1])
+
+    def _backend_now(self) -> str:
+        """当前生效的后端。显式配置（backend: napcat/snowluma）优先；
+        auto 在未探测完成前按 napcat 参数发出首页请求（两后端均会返回最新一页），
+        收到数据后由 _probe_backend 修正缓存。"""
+        if self.backend_cfg in ("napcat", "snowluma"):
+            return self.backend_cfg
+        return self._backend or "napcat"
+
+    @staticmethod
+    def _probe_backend(msgs: list) -> str | None:
+        """auto 后端探测：
+        NapCat : 消息带 real_seq 字段，且 message_seq == message_id；
+        SnowLuma: 无 real_seq，message_id 为 int32 哈希（≠单调会话号 message_seq）。"""
+        if not msgs:
+            return None
+        m0 = msgs[0]
+        if not isinstance(m0, dict):
+            return None
+        if m0.get("real_seq") is not None:
+            return "napcat"
+        seq = m0.get("message_seq")
+        mid = m0.get("message_id")
+        if seq is not None and mid is not None and str(seq) != str(mid):
+            return "snowluma"
+        return "napcat"
 
     def _segments_to_text(self, segments) -> str:
         """消息段 → 文本。图片/表情等替换为占位符，不导出媒体。"""
@@ -231,25 +359,42 @@ class NapcatHistoryExporter(Star):
         return len(ordered)
 
     async def _fetch(self, action: str, key: str, target_id: str,
-                     start_seq: int, count: int) -> list:
-        """调用 NapCat 扩展 API 拉取一页历史消息。
+                     start: int, count: int, client=None) -> list:
+        """调用后端扩展 API（get_group_msg_history / get_friend_msg_history）
+        拉取一页历史消息。
 
-        注意：NapCat 的 get_group_msg_history / get_friend_msg_history
-        要求 group_id / user_id / message_seq 均为字符串类型。
+        v1.5.0 参数差异：
+          NapCat  : group_id/user_id/message_seq 均为字符串，message_seq=0 取最新；
+          SnowLuma: group_id/user_id 传数值，锚点参数名为 message_id
+                    （int32 哈希，0=最新；未知参数会被静默忽略）。
+        start 为内部锚点：napcat = 序号（real_seq/message_seq），
+        snowluma = message_id 哈希。auto 模式下首页尚未探测完成前按 napcat
+        参数发出（两后端均会返回最新一页，无数据丢失），收到数据后由
+        _probe_backend 完成探测并缓存。
 
         aiocqhttp 的 call_action 已自动解包，resp 可能是：
-          a) {"messages": [...]}                    —— NapCat 实际返回（解包后）
+          a) {"messages": [...]}                    —— 后端实际返回（解包后）
           b) {"data": {"messages": [...]}}          —— 标准 OneBot 包装
           c) {"data": [...]}                        —— data 直接是列表
           d) {"status": "failed", "retcode": 1400}  —— 调用失败
         """
-        client = self._get_client()
+        if client is None:
+            client = await self._get_client()
         if client is None:
             return []
+        backend = self._backend_now()
         try:
-            resp = await client.call_action(
-                action, **{key: str(target_id), "message_seq": str(start_seq),
-                           "count": count})
+            if backend == "snowluma":
+                tid = target_id
+                if str(tid).isdigit():
+                    tid = int(tid)
+                resp = await client.call_action(
+                    action, **{key: tid, "message_id": int(start),
+                               "count": count})
+            else:
+                resp = await client.call_action(
+                    action, **{key: str(target_id), "message_seq": str(start),
+                               "count": count})
         except Exception as e:
             # v1.3.2: NapCat 翻页锚点消息不存在（retcode=1200，如 message_seq 传了
             # 不存在的 id）属预期行为 → 降级为 warning，停止翻页（已获取的消息保留）
@@ -285,8 +430,14 @@ class NapcatHistoryExporter(Star):
         if not msgs:
             logger.warning(
                 f"{action}({target_id}) 返回空消息列表"
-                f"（NapCat 本地可能无该会话的消息记录/AIO 缓存）")
+                f"（NapCat/SnowLuma 本地可能无该会话的消息记录/AIO 缓存）")
             return []
+        # v1.5.0: auto 后端探测（首次拿到有效数据时）
+        if self._backend is None and self.backend_cfg == "auto":
+            self._backend = self._probe_backend(msgs)
+            if self._backend:
+                logger.info(f"[NapCatExporter] 后端自动探测: {self._backend}"
+                            f"（可用配置项 backend 覆盖）")
         return msgs
 
     @staticmethod
@@ -319,20 +470,27 @@ class NapcatHistoryExporter(Star):
 
     async def _export_target(self, chat: str, target_id: str,
                              limit: int = 0, today_only: bool = False,
-                             start_ts: int = 0, end_ts: int = 0) -> int:
+                             start_ts: int = 0, end_ts: int = 0,
+                             client=None, bot_tag: str = "") -> int:
         """导出单个目标。
-
         limit > 0：按需导出最近 limit 条（去重追加，同时更新游标）；
         limit = 0：增量导出（以 time 时间戳为边界 + message_id 去重）。
         today_only=True（自动归档）：只归档当天消息，不导历史。
         start_ts/end_ts > 0：回溯导出 [start_ts, end_ts] 时间段消息
         （手动归档，不推进游标，不影响后续增量）。
+        client：指定使用的后端客户端（多 bot 场景按 bot 路由）；None 时自动获取。
+        bot_tag：日志标识（如 bot[QQ号]），用于多 bot 场景区分来源。
         返回本次新增写入的条数。
-
         注意：NapCat 返回的 message_seq = message_id（全局消息 ID），
         并非单调递增，不能用作增量游标；因此使用 time 做边界，
         并用已写 message_id 集合做去重（避免同秒消息重复/遗漏）。
         """
+        if client is None:
+            client = await self._get_client()
+            if client is None:
+                logger.warning("未获取到 aiocqhttp 客户端，跳过导出")
+                return 0
+        tag = f" [{bot_tag}]" if bot_tag else ""
         action = "get_group_msg_history" if chat == "group" \
             else "get_friend_msg_history"
         key = "group_id" if chat == "group" else "user_id"
@@ -343,7 +501,7 @@ class NapcatHistoryExporter(Star):
             seen = set(st.get("ids") or [])
         else:
             if st:  # 旧格式 int 游标（message_id 不单调，不可用）
-                logger.info(f"[NapCatExporter] {target_id} 检测到旧格式游标 "
+                logger.info(f"[NapCatExporter]{tag} {target_id} 检测到旧格式游标 "
                             f"{st!r}（message_id 不单调，已重置为 0，将全量补导）")
             last_t = 0
             seen = set()
@@ -363,7 +521,8 @@ class NapcatHistoryExporter(Star):
             if guard > 100:  # 防御：单次最多翻 100 页
                 logger.warning(f"[NapCatExporter] {target_id} 翻页超过 100 页，强制停止")
                 break
-            msgs = await self._fetch(action, key, target_id, start, self.batch)
+            msgs = await self._fetch(action, key, target_id, start,
+                                      self.batch, client=client)
             if not msgs:
                 break
             if limit > 0:
@@ -426,17 +585,35 @@ class NapcatHistoryExporter(Star):
                             break
                     else:
                         consecutive_empty = 0
-            # 向前翻页（拿更早的）：v1.3.4 优先用 real_seq（单调递增，
-            # 传 min-1 精确定位更早消息）；无 real_seq 时回退页内最小
-            # message_id（真实存在，NapCat 返回其之前更早的消息）
-            anchors = [a for a in (self._anchor_of(m) for m in msgs)
-                       if a is not None]
-            if anchors:
-                start = min(anchors) - 1
+            # 向前翻页（拿更早的）
+            if self._backend_now() == "snowluma":
+                # SnowLuma：锚点=本页最旧消息的 message_id（int32 哈希，须
+                # 原值回传，由其内部定位 sequence 往前翻；reverse_order 默认
+                # true 会包含锚点消息本身，靠 local_seen 去重）
+                anchor_msg = min(
+                    msgs, key=lambda m: (self._time_of(m), self._seq_of(m)))
+                anchor_id = anchor_msg.get("message_id")
+                if anchor_id is None or anchor_id == "":
+                    break
+                start = int(anchor_id)
+                if start == 0 or len(fetched) >= 5000:
+                    break  # 哈希锚点为 0（无有效 id）或已达上限 → 停止
+                # 本页只有锚点一条 → 已翻到最早，下页必然重复/为空
+                if (len(msgs) == 1
+                        and self._mid_of(msgs[0]) == self._mid_of(anchor_msg)):
+                    break
             else:
-                start = min(self._seq_of(m) for m in msgs)
-            if start < 1 or len(fetched) >= 5000:
-                break
+                # NapCat：v1.3.4 优先用 real_seq（单调递增，传 min-1 精确定位
+                # 更早消息）；无 real_seq 时回退页内最小 message_seq（真实存在，
+                # NapCat 返回其之前更早的消息）
+                anchors = [a for a in (self._anchor_of(m) for m in msgs)
+                           if a is not None]
+                if anchors:
+                    start = min(anchors) - 1
+                else:
+                    start = min(self._seq_of(m) for m in msgs)
+                if start < 1 or len(fetched) >= 5000:
+                    break
         if not fetched:
             return 0
         # 按 time 排序
@@ -472,62 +649,79 @@ class NapcatHistoryExporter(Star):
         return written
 
     async def _auto_export_once(self, apply_rules: bool = True) -> int:
-        """定时一轮：导出所有群（可选项私聊）的增量消息。
-
+        """定时一轮：遍历所有“启用归档”的 aiocqhttp 实例（多 bot），
+        各自导出其群/私聊增量消息。
         apply_rules=True（循环导出模式）：应用群白名单、只归档当天消息；
         apply_rules=False（用户/LLM 手动触发全量增量）：不过滤，可导历史。
+
+        v1.5.0 多 bot：archive_bots 留空=全部实例；同一轮中不同 bot 出现
+        的相同群/好友只导出一次（同群消息对所有 bot 一致，避免重复拉取）。
         """
-        client = self._get_client()
-        if client is None:
-            logger.warning("未获取到 aiocqhttp 客户端，本轮跳过")
+        clients = await self._get_clients()
+        if not clients:
+            logger.warning("未获取到可用的 aiocqhttp 客户端，本轮跳过")
             return 0
         total = 0
-        try:
-            groups = await client.call_action("get_group_list")
-        except Exception as e:
-            logger.error(f"获取群列表失败: {e}")
-            groups = []
-        groups = groups or []
-        if apply_rules and self.whitelist:
-            before = len(groups)
-            groups = [g for g in groups
-                      if str(g.get("group_id", "")) in self.whitelist]
-            if len(groups) != before:
-                logger.info(f"白名单过滤：{before} 个群 → {len(groups)} 个（仅白名单内导出）")
-            if not groups:
-                logger.info("白名单内没有可导出的群，本轮跳过")
-                return 0
-        logger.info(f"定时导出开始：共 {len(groups)} 个群")
-        for g in groups:
-            gid = str(g.get("group_id", ""))
-            if not gid:
-                continue
+        seen_targets: set = set()  # 本轮已导出目标（跨 bot 去重）
+        for pid, qq, client in clients:
+            bot_tag = f"bot[{qq or pid or '?'}]"
+            # ---------------- 群 ----------------
             try:
-                n = await self._export_target("group", gid,
-                                              today_only=apply_rules)
-                if n:
-                    logger.info(f"群 {gid} 新增 {n} 条")
+                groups = await client.call_action("get_group_list")
             except Exception as e:
-                logger.error(f"导出群 {gid} 失败: {e}")
-            total += n
-        if self.auto_friends:
-            try:
-                friends = await client.call_action("get_friend_list")
-            except Exception as e:
-                logger.error(f"获取好友列表失败: {e}")
-                friends = []
-            for f in friends or []:
-                uid = str(f.get("user_id", ""))
-                if not uid:
+                logger.error(f"[{bot_tag}] 获取群列表失败: {e}")
+                groups = []
+            groups = groups or []
+            if apply_rules and self.whitelist:
+                before = len(groups)
+                groups = [g for g in groups
+                          if str(g.get("group_id", "")) in self.whitelist]
+                if len(groups) != before:
+                    logger.info(f"[{bot_tag}] 白名单过滤：{before} 个群 → "
+                                f"{len(groups)} 个（仅白名单内导出）")
+                if not groups:
+                    logger.info(f"[{bot_tag}] 白名单内没有可导出的群，跳过")
                     continue
+            logger.info(f"定时导出 [{bot_tag}]：共 {len(groups)} 个群")
+            for g in groups:
+                gid = str(g.get("group_id", ""))
+                if not gid:
+                    continue
+                if gid in seen_targets:
+                    continue  # 同一轮其他 bot 已导出（同群消息一致）
+                seen_targets.add(gid)
                 try:
-                    n = await self._export_target("private", uid,
-                                                  today_only=apply_rules)
+                    n = await self._export_target(
+                        "group", gid, today_only=apply_rules,
+                        client=client, bot_tag=bot_tag)
                     if n:
-                        logger.info(f"私聊 {uid} 新增 {n} 条")
+                        logger.info(f"[{bot_tag}] 群 {gid} 新增 {n} 条")
                 except Exception as e:
-                    logger.error(f"导出私聊 {uid} 失败: {e}")
+                    logger.error(f"[{bot_tag}] 导出群 {gid} 失败: {e}")
                 total += n
+            # ---------------- 私聊 ----------------
+            if self.auto_friends:
+                try:
+                    friends = await client.call_action("get_friend_list")
+                except Exception as e:
+                    logger.error(f"[{bot_tag}] 获取好友列表失败: {e}")
+                    friends = []
+                for f in friends or []:
+                    uid = str(f.get("user_id", ""))
+                    if not uid:
+                        continue
+                    if uid in seen_targets:
+                        continue
+                    seen_targets.add(uid)
+                    try:
+                        n = await self._export_target(
+                            "private", uid, today_only=apply_rules,
+                            client=client, bot_tag=bot_tag)
+                        if n:
+                            logger.info(f"[{bot_tag}] 私聊 {uid} 新增 {n} 条")
+                    except Exception as e:
+                        logger.error(f"[{bot_tag}] 导出私聊 {uid} 失败: {e}")
+                    total += n
         logger.info(f"定时导出完成，本轮新增 {total} 条（目录: {self.export_dir.resolve()}）")
         return total
 
@@ -623,11 +817,11 @@ class NapcatHistoryExporter(Star):
         按需导出指定 QQ 群的历史聊天记录为 JSONL 文件（图片/表情等用占位符）。
         适合需要把某群聊天记录保存成文件、供后续搜索/分析的场景。
         与定时模式共用同一套增量游标，重复导出不会产生大量重复数据。
-
+        v1.5.0：多 bot 时按触发本消息的 bot（self_id）路由到对应实例归档，
+        目标群必须属于该 bot（或用 get_export_status 查看归档了哪些 bot）。
         Args:
           group_id(string): 目标 QQ 群号（纯数字，必填）
           count(number): 导出的消息条数上限（默认 200，最大 5000）
-
         返回: 导出摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
@@ -636,7 +830,13 @@ class NapcatHistoryExporter(Star):
         if not gid.isdigit():
             return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
         count = max(1, min(int(count), 5000))
-        written = await self._export_target("group", gid, limit=count)
+        client, pid, qq = await self._client_for_event(event)
+        if client is None:
+            return ("❌ 未能定位触发此消息的 bot（未启用归档或未找到对应"
+                    " aiocqhttp 实例），请检查 archive_bots 配置。")
+        bot_tag = f"bot[{qq or pid or '?'}]"
+        written = await self._export_target(
+            "group", gid, limit=count, client=client, bot_tag=bot_tag)
         if written > 0:
             # v1.3.0: 手动归档过的目标加入保护名单，自动清理不删除其文件
             self._state.setdefault("protected", {}).setdefault("group", [])
@@ -646,19 +846,18 @@ class NapcatHistoryExporter(Star):
                 logger.info(f"[NapCatExporter] 群 {gid} 已加入手动归档保护名单")
         path = self.export_dir
         return (f"✅ 群 {gid} 导出完成：新增 {written} 条"
-                f"（导出目录: {path}）")
-
+                f"（{bot_tag}，导出目录: {path}）")
     @filter.llm_tool("export_private_history")
     async def export_private_history(self, event: AstrMessageEvent,
                                      user_id: str, count: int = 200):
         '''
         按需导出指定 QQ 好友的私聊历史记录为 JSONL 文件（图片/表情用占位符）。
-        注意：NapCat 需保存有与该好友的聊天记录。
-
+        注意：后端（NapCat/SnowLuma）需保存有与该好友的聊天记录。
+        v1.5.0：多 bot 时按触发本消息的 bot（self_id）路由到对应实例归档，
+        目标好友必须属于该 bot。
         Args:
           user_id(string): 目标 QQ 号（纯数字，必填）
           count(number): 导出的消息条数上限（默认 200，最大 5000）
-
         返回: 导出摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
@@ -667,7 +866,13 @@ class NapcatHistoryExporter(Star):
         if not uid.isdigit():
             return f"❌ QQ 号格式错误：{user_id}。应为纯数字。"
         count = max(1, min(int(count), 5000))
-        written = await self._export_target("private", uid, limit=count)
+        client, pid, qq = await self._client_for_event(event)
+        if client is None:
+            return ("❌ 未能定位触发此消息的 bot（未启用归档或未找到对应"
+                    " aiocqhttp 实例），请检查 archive_bots 配置。")
+        bot_tag = f"bot[{qq or pid or '?'}]"
+        written = await self._export_target(
+            "private", uid, limit=count, client=client, bot_tag=bot_tag)
         if written > 0:
             # v1.3.0: 手动归档过的目标加入保护名单，自动清理不删除其文件
             self._state.setdefault("protected", {}).setdefault("private", [])
@@ -676,7 +881,7 @@ class NapcatHistoryExporter(Star):
                 self._save_state()
                 logger.info(f"[NapCatExporter] 私聊 {uid} 已加入手动归档保护名单")
         return (f"✅ 与 {uid} 的私聊导出完成：新增 {written} 条"
-                f"（导出目录: {self.export_dir}）")
+                f"（{bot_tag}，导出目录: {self.export_dir}）")
 
     @filter.llm_tool("export_all_incremental")
     async def export_all_incremental(self, event: AstrMessageEvent,
@@ -686,16 +891,22 @@ class NapcatHistoryExporter(Star):
         '''
         立即归档（手动触发，不受自动归档开关/白名单/当天限制）：
         默认增量归档全部群；可指定群号与时间段回溯归档历史消息。
+        v1.5.0：多 bot 时归档范围 = 触发本消息的 bot（self_id）所属实例
+        的群；留空 group_id 时归档该 bot 的全部群。
 
         Args:
-          group_id(string): 目标群号（可选，留空=全部群）
+          group_id(string): 目标群号（可选，留空=该 bot 全部群）
           start_date(string): 开始日期 YYYY-MM-DD（可选，留空=不限起点）
           end_date(string): 结束日期 YYYY-MM-DD（可选，留空=不限终点）
-
         返回: 归档摘要（新增条数、文件路径）
         '''
         if not self._is_allowed(event):
             return "❌ 无权限：仅管理员可以使用此工具。"
+        client, pid, qq = await self._client_for_event(event)
+        if client is None:
+            return ("❌ 未能定位触发此消息的 bot（未启用归档或未找到对应"
+                    " aiocqhttp 实例），请检查 archive_bots 配置。")
+        bot_tag = f"bot[{qq or pid or '?'}]"
         start_ts = 0
         end_ts = 0
         try:
@@ -716,17 +927,15 @@ class NapcatHistoryExporter(Star):
             if not gid.isdigit():
                 return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
             written = await self._export_target(
-                "group", gid, start_ts=start_ts, end_ts=end_ts)
+                "group", gid, start_ts=start_ts, end_ts=end_ts,
+                client=client, bot_tag=bot_tag)
             return (f"✅ 群 {gid} 归档完成：新增 {written} 条"
-                    f"（导出目录: {self.export_dir}）")
-        # 全部群
-        client = self._get_client()
-        if client is None:
-            return "❌ 未获取到 aiocqhttp 客户端，请检查适配器配置。"
+                    f"（{bot_tag}，导出目录: {self.export_dir}）")
+        # 该 bot 的全部群
         try:
             groups = await client.call_action("get_group_list")
         except Exception as e:
-            logger.error(f"获取群列表失败: {e}")
+            logger.error(f"[{bot_tag}] 获取群列表失败: {e}")
             groups = []
         total = 0
         for g in groups or []:
@@ -734,20 +943,19 @@ class NapcatHistoryExporter(Star):
             if not gid:
                 continue
             try:
-                n = await self._export_target("group", gid,
-                                              start_ts=start_ts,
-                                              end_ts=end_ts)
+                n = await self._export_target(
+                    "group", gid, start_ts=start_ts, end_ts=end_ts,
+                    client=client, bot_tag=bot_tag)
                 total += n
             except Exception as e:
-                logger.error(f"归档群 {gid} 失败: {e}")
+                logger.error(f"[{bot_tag}] 归档群 {gid} 失败: {e}")
         return (f"✅ 全部群归档完成，新增 {total} 条"
-                f"（导出目录: {self.export_dir}）")
+                f"（{bot_tag}，导出目录: {self.export_dir}）")
 
     @filter.llm_tool("get_export_status")
     async def get_export_status(self, event: AstrMessageEvent):
         '''
-        查看导出器状态：模式、导出目录、各群/私聊的最新导出游标与文件数。
-
+        查看导出器状态：模式、后端、归档的 bot、导出目录、各群/私聊的最新导出游标与文件数。
         返回: 状态摘要
         '''
         if not self._is_allowed(event):
@@ -757,6 +965,9 @@ class NapcatHistoryExporter(Star):
         lines = [
             f"自动归档: {'开启' if self.auto_export else '关闭'}"
             f"（间隔 {self.interval}s）",
+            f"后端: {self._backend_now()}（配置 backend={self.backend_cfg}，"
+            f"auto 探测结果: {self._backend or '尚未探测'}）",
+            f"归档 bot 配置: {self.archive_bots if self.archive_bots else '(全部 aiocqhttp 实例)'}",
             f"导出目录(配置值): {self.export_dir!r}",
             f"导出目录(绝对路径): {exp}",
             f"state.json 路径: {self.state_file.resolve()}",

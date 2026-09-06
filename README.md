@@ -4,7 +4,9 @@
 
 > 如图片有侵权，请联系插件作者删除（作者平时很忙，不是故意不回！）
 
-通过 NapCat（OneBot v11）扩展 API 将历史聊天记录导出为 **JSONL 文件**，图片/表情/语音等媒体**不导出**，统一使用 `[图片]` `[表情]` 等**占位符**替换。适合做聊天记录存档、归档检索与离线分析。
+通过 **NapCat / SnowLuma**（OneBot v11）扩展 API 将历史聊天记录导出为 **JSONL 文件**，图片/表情/语音等媒体**不导出**，统一使用 `[图片]` `[表情]` 等**占位符**替换。适合做聊天记录存档、归档检索与离线分析。
+
+> **v1.5.0 亮点**：原生支持 **SnowLuma**（NapCat 姊妹项目，`backend` 自动探测）+ **多 bot 归档**（一个 AstrBot 多个 aiocqhttp 实例，可指定归档其中任意一个或多个 bot）。详见下文「多 bot 与 SnowLuma」。
 
 > ## ⚠️ 联动机制已移除（v1.4.0 起）
 >
@@ -20,6 +22,40 @@
   - 私聊：`napcat_private_<QQ号>_YYYY-MM-DD.jsonl`
 - 🧩 **媒体占位符**：图片 `[图片]`、表情 `[表情]`、语音 `[语音]`、视频 `[视频]`、引用 `[引用消息]`、@ `[At:QQ]`、文件 `[文件:名称]` 等
 - ⚡ **增量游标**：记录每个群/好友的最新时间戳，重复运行只追加新消息；文件自动去重排序，不会重复
+- 🤖 **多 bot 归档**（v1.5.0）：一个 AstrBot 可挂多个 QQ 号（多个 aiocqhttp 实例），插件为每个 bot 独立归档其可见群/私聊；可用 `archive_bots` 指定只归档其中任意一个或多个
+- 🔌 **SnowLuma 支持**（v1.5.0）：NapCat 姊妹项目自动兼容，无需配置（`backend: auto` 自动探测，也可手动指定）
+
+## 多 bot 与 SnowLuma（v1.5.0）
+
+### 多 bot（多个 QQ 号挂在一个 AstrBot 上）
+
+AstrBot 中每个 QQ 号 = 一个独立的 aiocqhttp 平台实例（WebUI 平台配置里每一项有唯一 `id`）。v1.5.0 起插件会：
+
+- **自动遍历全部启用的 aiocqhttp 实例**，每个 bot 归档自己可见的群与私聊；
+- 定时循环日志带 bot 标识：`定时导出 [bot[QQ号]]：共 N 个群`；
+- LLM 工具（导出/归档）**按触发消息的 bot（self_id）自动路由**——在 bot A 的群里让喵导出，只会操作 bot A 的数据；
+- 若多个 bot 在**同一个群**：同一轮只归档一次（同群消息对所有 bot 一致），文件与游标天然兼容，不会冲突或重复；
+- 不同 bot 的归档写入**同一导出目录**：群号/QQ 号全局唯一，文件名不冲突；同一群即使两个 bot 都触发也因消息一致而幂等去重。
+
+**`archive_bots` 配置**：留空 `[]` = 归档全部 aiocqhttp 实例（默认）；填一个或多个**平台实例 id**（WebUI 平台配置里自己起的 id）或**登录 QQ 号** = 只归档指定的 bot。例如：
+
+```yaml
+archive_bots:
+  - 123456789          # 按 QQ 号指定
+  - my_bot_2           # 或按平台实例 id 指定
+```
+
+> 小提示：`get_export_status` 会显示当前「归档 bot 配置」与每个 bot 的情况；被 `archive_bots` 排除的 bot 会在日志中提示「bot 未启用归档」。
+
+### SnowLuma
+
+**SnowLuma**（SnowLuma/SnowLuma，⭐1.1k+）是 NapCat 官方组织推出的姊妹项目，同为 OneBot v11 运行时。AstrBot 的 aiocqhttp 适配器可直接连接 SnowLuma，插件自动兼容：
+
+- `backend: auto`（默认）：首次拉到消息后自动探测后端（NapCat 消息带 `real_seq` 且 `message_seq == message_id`；SnowLuma 无 `real_seq`，`message_id` 为 int32 哈希），日志会打印「后端自动探测: napcat/snowluma」；
+- 也可手动指定 `backend: napcat` 或 `backend: snowluma` 跳过探测；
+- 翻页锚点按后端协议自动适配（NapCat 用 `message_seq`，SnowLuma 用 `message_id` 哈希），全量/增量/回溯导出均可正常工作。
+
+> 已知差异：SnowLuma 的历史接口基于其本地消息库（SQLite），**能导出的历史深度取决于 SnowLuma 运行以来积累的消息**，旧于其启动时间的消息可能取不到（NapCat 同样依赖本地缓存，行为类似）。翻到底时 SnowLuma 会返回空列表并停止（NapCat 是 retcode=1200），日志里的「返回空消息列表」WARN 为正常停止信号。
 
 ## 输出格式
 
@@ -64,6 +100,8 @@
 | `whitelist` | `[]`（全部）| **自动归档群白名单**：仅名单内的群会被定时循环导出；留空=全部群。用户/LLM 手动归档不受此限制 |
 | `auto_clean` | `true` | **历史文件自动清理开关**：定时循环导出时自动删除超过保留天数的历史 JSONL（手动归档过的目标除外）|
 | `clean_days` | `14` | 历史文件保留天数（默认 14 天，更早的自动删除）|
+| `archive_bots` | `[]`（全部）| **多 bot 归档白名单**（v1.5.0）：留空=归档全部 aiocqhttp 实例；填写平台实例 id 或登录 QQ 号=只归档指定的一个或多个 bot（详见「多 bot 与 SnowLuma」）|
+| `backend` | `auto` | **后端协议**（v1.5.0）：`auto`=自动探测 NapCat/SnowLuma；`napcat`/`snowluma`=强制指定 |
 
 ## 运行时日志说明（可忽略的提示）
 
@@ -74,15 +112,17 @@
 | `get_group_msg_history(...) 翻页停止: retcode=1200 消息XXX不存在` | WARN | 每群每轮定时导出时，最多 1 条 | 翻页翻到了该群**历史最早期边界**，NapCat 返回"消息不存在"；插件将其作为正常停止信号，不再继续向前翻页（防死循环机制）|
 | `[账号1] [error] 发生错误 Error: 消息XXX不存在` | ERROR | 与上一条同时出现 | **NapCat 自身**对同一个 1200 响应的内部打印，与插件无关 |
 | `WARN 似乎是旧版客户端，尝试仅通过序号获取引用消息` | WARN | 偶发，解析含引用（reply）的消息时 | **NapCat 自身**解析引用消息的兼容提示，不是插件问题；正常时偶发，不会刷屏 |
+| `get_group_msg_history(...) 返回空消息列表（NapCat/SnowLuma 本地可能无该会话的消息记录/AIO 缓存）` | WARN | SnowLuma 后端每群每轮翻到底时 | **SnowLuma 的正常停止信号**：其历史接口基于本地消息库，翻到最早处会返回空列表，插件随即停止本群翻页（NapCat 则返回 retcode=1200，见上方第一条）|
 
 > 判断标准：只要**导出文件正常生成、内容无重复**（可通过 `get_export_status` 查看），上述日志都无需处理。
 > 例外：若"旧版客户端"提示**大量刷屏**（每分钟几十条），说明翻页出现异常循环，请升级插件或反馈作者。
 
 ## 使用前提
 
-- AstrBot 使用 `aiocqhttp` 适配器连接 NapCat
-- NapCat 本地保存有需要导出的聊天记录（OneBot v11 消息缓存）
-- 需要调用 NapCat 扩展 API：`get_group_msg_history` / `get_friend_msg_history`（Go-CQHTTP 兼容接口）
+- AstrBot 使用 `aiocqhttp` 适配器连接 NapCat **或 SnowLuma**（均为 OneBot v11）
+- 需要调用扩展 API：`get_group_msg_history` / `get_friend_msg_history`（Go-CQHTTP 兼容接口，NapCat 与 SnowLuma 均已实现）
+- 后端本地需保存有需要导出的聊天记录（OneBot v11 消息缓存/消息库）
+- 多 bot：一个 AstrBot 上启用多个 aiocqhttp 平台实例（每个实例连一个 QQ 号的 NapCat/SnowLuma）
 
 ## 安装
 

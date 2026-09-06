@@ -1,11 +1,56 @@
 name: astrbot_plugin_napcat_history_exporter
-desc: 通过 NapCat 扩展 API 将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出（默认 120s）与按需触发两种模式，可供搜索插件联动
+desc: 通过 NapCat / SnowLuma（OneBot v11 扩展 API）将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出（默认 120s）与按需触发两种模式；v1.5.0 起支持多 bot（多 aiocqhttp 实例）分别/选择性归档，后端 NapCat/SnowLuma 可自动探测
 author: baizi51676-source
-version: 1.4.2
+version: 1.5.0
 repo: https://github.com/baizi51676-source/astrbot_plugin_napcat_history_exporter
 display_name: NapCat 历史记录导出器
-short_desc: 导出 NapCat 历史聊天记录为 JSONL（定时增量/按需触发）
+short_desc: 导出 NapCat/SnowLuma 历史聊天记录为 JSONL（定时增量/多 bot/按需触发）
 category: 工具
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.0.0,<5"
+config:
+  auto_export:
+    type: bool
+    default: true
+    description: 自动归档开关：开启后定时循环增量导出，关闭后仅在被 LLM 工具触发时归档
+  interval_seconds:
+    type: int
+    default: 120
+    description: 定时循环间隔（秒，最小 30）
+  count_per_batch:
+    type: int
+    default: 50
+    description: 每页拉取条数（1-200，默认 50）
+  auto_export_friends:
+    type: bool
+    default: false
+    description: 自动归档私聊（好友）消息
+  admin_only:
+    type: bool
+    default: true
+    description: 仅管理员可使用 LLM 导出工具
+  whitelist:
+    type: list
+    default: []
+    description: 定时归档群白名单（留空=全部群）
+  auto_clean:
+    type: bool
+    default: true
+    description: 自动清理过期历史文件
+  clean_days:
+    type: int
+    default: 14
+    description: 历史文件保留天数（超过自动清理，手动归档过的目标除外）
+  export_dir:
+    type: string
+    default: data/workspaces/napcat_exports
+    description: 导出目录（JSONL 文件与游标状态存放位置）
+  archive_bots:
+    type: list
+    default: []
+    description: 多 bot 归档白名单（v1.5.0）：留空=归档全部 aiocqhttp 实例；填写平台实例 id 或登录 QQ 号=只归档指定的一个或多个 bot
+  backend:
+    type: string
+    default: auto
+    description: 后端协议（v1.5.0）：auto=自动探测 NapCat/SnowLuma；napcat=强制 NapCat；snowluma=强制 SnowLuma
