@@ -132,3 +132,23 @@ plugin i https://github.com/baizi51676-source/astrbot_plugin_napcat_history_expo
 ```
 
 或下载 Release 附件 zip，解压到 `AstrBot/data/plugins/`，然后在 WebUI 启用。
+
+## 如何更新（重要）
+
+> ⚠️ **改名预告（v1.5.2 起）**：插件已同时支持 SnowLuma 与 NapCat 双平台，因此从 **v2.0.0** 开始，插件与仓库将更名为 **`astrbot_plugin_chat_history_archiver`**（中文名「snowluma和napcat历史消息归档与查看」）。旧地址会自动重定向，不影响使用，迁移方法见下方说明。
+
+**已安装本插件的用户，请按你的安装方式选择更新路径：**
+
+1. **通过 `plugin i <仓库地址>` 安装（推荐方式）**：
+   - v2.0.0 之前（含 v1.5.x）：仓库地址不变，在 AstrBot 插件页直接点「更新」即可；
+   - v2.0.0 之后：仓库改名，GitHub 会将旧地址**自动重定向**到新仓库，直接点「更新」通常仍可成功；
+   - 若更新按钮提示失败，改用新地址执行一次：
+     ```bash
+     plugin i https://github.com/baizi51676-source/astrbot_plugin_chat_history_archiver
+     ```
+2. **通过 Release zip 手动安装**：
+   - 到 GitHub Releases 页下载最新版 zip（旧版本 zip 下载链接仍然有效，会自动跳转），解压后**覆盖** `AstrBot/data/plugins/` 下同名插件目录，然后重启 AstrBot 或在 WebUI 停用→启用一次插件；
+   - v2.0.0 起解压目录名变为 `astrbot_plugin_chat_history_archiver`，若旧目录仍存在请删除旧目录后放入新目录。
+3. **通过插件市场安装**：改名后市场条目会更新为新名字；旧条目可能无法继续检测更新，此时请卸载旧插件，搜索新名字重新安装（配置项需重新填写一次，归档文件不受影响）。
+
+**升级不影响你的数据**：历史 JSONL 归档文件与游标状态存放在 AstrBot 数据目录的导出目录（默认 `data/workspaces/napcat_exports`）中，不在插件目录里，覆盖/重装插件**不会丢失任何已归档记录**。
