@@ -1,68 +1,68 @@
 {
+  "backend": {
+    "description": "后端协议",
+    "type": "string",
+    "default": "auto",
+    "hint": "auto：自动探测 NapCat / SnowLuma（推荐，首次拉到消息后自动识别并缓存）；napcat：强制 NapCat；snowluma：强制 SnowLuma。"
+  },
   "export_dir": {
-    "description": "导出目录（JSONL 文件与游标状态存放位置）",
+    "description": "导出目录",
     "type": "string",
     "default": "data/workspaces/napcat_exports",
-    "hint": "相对 AstrBot 工作目录（如 /root/astrbot）。默认与日志归档插件的 workspaces 同级（data/workspaces/napcat_exports）。与特殊版插件（astrbot_plugin_group_forwarder_special）联动搜索时，在特殊版配置中把 export_dir 设成同一路径即可。"
+    "hint": "JSONL 文件与游标状态存放位置，相对 AstrBot 工作目录（如 /root/astrbot）。默认位于 data/workspaces/napcat_exports。"
   },
   "auto_export": {
     "description": "自动归档开关",
     "type": "bool",
     "default": true,
-    "hint": "开启后定时循环增量归档（默认 120s 一次，仅归档当天消息，受群白名单限制）；关闭后仅在被 LLM 工具触发时归档。"
+    "hint": "开启后每 interval_seconds 秒增量归档一次新消息；关闭后仅在被 LLM 工具触发时归档。"
   },
   "interval_seconds": {
     "description": "定时循环间隔（秒）",
     "type": "int",
     "default": 120,
-    "hint": "auto 模式下每隔该秒数检查一次各群是否有新消息并增量导出。最小值 30。"
+    "hint": "自动归档模式下的检查间隔，最小 30 秒。"
   },
-  "count_per_batch": {
-    "description": "单次 API 拉取条数",
-    "type": "int",
-    "default": 50,
-    "hint": "每次调用 get_group_msg_history / get_friend_msg_history 拉取的条数（1-200）。"
+  "whitelist": {
+    "description": "自动归档群白名单",
+    "type": "list",
+    "default": [],
+    "hint": "仅对定时循环导出生效：只归档名单内的群；留空 = 全部群。手动/LLM 触发归档不受此限制。"
   },
   "auto_export_friends": {
     "description": "定时模式同时导出私聊",
     "type": "bool",
     "default": false,
-    "hint": "开启后定时循环也会增量导出所有好友的私聊记录（需 NapCat 保存有聊天记录）。"
+    "hint": "开启后定时循环也会增量导出所有好友的私聊记录（需后端保存有聊天记录）。"
   },
-  "admin_only": {
-    "description": "仅管理员可以使用导出工具",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后只有 AstrBot 管理员可以调用导出相关 LLM 工具。manual 模式始终仅管理员可用。"
-  },
-  "whitelist": {
-    "description": "自动归档群聊白名单（仅循环导出模式生效）",
+  "archive_bots": {
+    "description": "多 bot 归档白名单",
     "type": "list",
     "default": [],
-    "hint": "只对定时循环导出生效：仅在名单内的群才会自动导出聊天文件；留空=全部群。用户/LLM 手动归档不受此限制。"
+    "hint": "一个 QQ 号 = 一个 aiocqhttp 平台实例。留空 = 归档全部实例（默认）；填写平台实例 id 或登录 QQ 号则只归档指定的 bot，例如 [\"123456789\", \"my_bot_2\"]。"
   },
-  "auto_clean": {
-    "description": "历史文件自动清理开关（仅循环导出模式生效）",
+  "count_per_batch": {
+    "description": "单次 API 拉取条数",
+    "type": "int",
+    "default": 50,
+    "hint": "每次调用 get_group_msg_history / get_friend_msg_history 拉取的条数，范围 1-200。"
+  },
+  "admin_only": {
+    "description": "仅管理员可使用导出工具",
     "type": "bool",
     "default": true,
-    "hint": "开启后自动删除超过保留天数的历史 JSONL 文件（手动归档过的目标除外）。"
+    "hint": "开启后只有 AstrBot 管理员可以调用导出相关 LLM 工具。"
+  },
+  "auto_clean": {
+    "description": "历史文件自动清理开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后定时循环导出时自动删除超过保留天数的历史 JSONL 文件（手动归档过的目标除外）。"
   },
   "clean_days": {
     "description": "历史文件保留天数",
     "type": "int",
     "default": 14,
-    "hint": "仅保留最近 N 天的历史文件，更早的自动删除（默认 14 天）。手动归档过的目标文件不清理。"
-  },
-  "archive_bots": {
-    "description": "多 bot 归档白名单（v1.5.0）",
-    "type": "list",
-    "default": [],
-    "hint": "一个 QQ 号 = 一个 aiocqhttp 平台实例。留空 = 归档全部 aiocqhttp 实例（默认）；填写一个或多个平台实例 id（WebUI 平台配置里自己起的 id）或登录 QQ 号，则只归档指定的 bot。例如 [\"123456789\", \"my_bot_2\"]。"
-  },
-  "backend": {
-    "description": "后端协议（v1.5.0）",
-    "type": "string",
-    "default": "auto",
-    "hint": "auto = 自动探测 NapCat/SnowLuma（默认，首次拉到消息后探测并打印日志）；napcat = 强制 NapCat；snowluma = 强制 SnowLuma。"
+    "hint": "仅保留最近 N 天的历史文件，更早的自动删除。手动归档过的目标文件不清理。"
   }
 }

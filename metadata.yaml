@@ -1,9 +1,9 @@
-name: astrbot_plugin_napcat_history_exporter
-desc: 通过 NapCat / SnowLuma（OneBot v11 扩展 API）将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出（默认 120s）与按需触发两种模式；v1.5.0 起支持多 bot（多 aiocqhttp 实例）分别/选择性归档，后端 NapCat/SnowLuma 可自动探测
+name: astrbot_plugin_chat_history_archiver
+desc: 通过 NapCat / SnowLuma（OneBot v11 扩展 API）将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出、按需回溯归档、多 bot（多 aiocqhttp 实例）独立归档与后端自动探测
 author: baizi51676-source
-version: 1.5.2
-repo: https://github.com/baizi51676-source/astrbot_plugin_napcat_history_exporter
-display_name: NapCat 历史记录导出器
+version: 2.0.0
+repo: https://github.com/baizi51676-source/astrbot_plugin_chat_history_archiver
+display_name: snowluma和napcat历史消息归档与查看
 short_desc: 导出 NapCat/SnowLuma 历史聊天记录为 JSONL（定时增量/多 bot/按需触发）
 category: 工具
 support_platforms:
@@ -49,8 +49,8 @@ config:
   archive_bots:
     type: list
     default: []
-    description: 多 bot 归档白名单（v1.5.0）：留空=归档全部 aiocqhttp 实例；填写平台实例 id 或登录 QQ 号=只归档指定的一个或多个 bot
+    description: 多 bot 归档白名单：留空=归档全部 aiocqhttp 实例；填写平台实例 id 或登录 QQ 号=只归档指定的一个或多个 bot
   backend:
     type: string
     default: auto
-    description: 后端协议（v1.5.0）：auto=自动探测 NapCat/SnowLuma；napcat=强制 NapCat；snowluma=强制 SnowLuma
+    description: 后端协议：auto=自动探测 NapCat/SnowLuma；napcat=强制 NapCat；snowluma=强制 SnowLuma
