@@ -359,7 +359,8 @@ class NapcatHistoryExporter(Star):
 
     def _merge_write(self, path: Path, records: list) -> int:
         """v1.3.3: 合并写入——读现有文件行 + 新记录，按 seq 去重、
-        按 t 排序后整体重写。文件自愈：不依赖内存去重，永不重复、有序。"""
+        按 t 排序后整体重写。文件自愈：不依赖内存去重，永不重复、有序。
+        v2.1.0: 返回实际新增条数（合并后新增，重复消息不计入）。"""
         merged: dict = {}
         if path.exists():
             for ln in path.read_text(encoding="utf-8",
@@ -373,6 +374,7 @@ class NapcatHistoryExporter(Star):
                     merged[key] = r
                 except Exception:
                     continue
+        before = len(merged)  # v2.1.0: 合并前已有（去重）条数基线
         for r in records:
             key = str(r.get("seq") or
                       (r.get("user_id", "") + r.get("t", "")))
@@ -382,7 +384,7 @@ class NapcatHistoryExporter(Star):
         with open(path, "w", encoding="utf-8") as f:
             for r in ordered:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        return len(ordered)
+        return max(0, len(ordered) - before)
 
     async def _fetch(self, action: str, key: str, target_id: str,
                      start: int, count: int, client=None) -> list:
@@ -497,7 +499,8 @@ class NapcatHistoryExporter(Star):
     async def _export_target(self, chat: str, target_id: str,
                              limit: int = 0, today_only: bool = False,
                              start_ts: int = 0, end_ts: int = 0,
-                             client=None, bot_tag: str = "") -> int:
+                             client=None, bot_tag: str = "",
+                             ignore_seen: bool = False) -> int:
         """导出单个目标。
         limit > 0：按需导出最近 limit 条（去重追加，同时更新游标）；
         limit = 0：增量导出（以 time 时间戳为边界 + message_id 去重）。
@@ -505,8 +508,10 @@ class NapcatHistoryExporter(Star):
         start_ts/end_ts > 0：回溯导出 [start_ts, end_ts] 时间段消息
         （手动归档，不推进游标，不影响后续增量）。
         client：指定使用的后端客户端（多 bot 场景按 bot 路由）；None 时自动获取。
-        bot_tag：日志标识（如 bot[QQ号]），用于多 bot 场景区分来源。
-        返回本次新增写入的条数。
+        bot_tag：日志标识（如 bot[QQ 号]），用于多 bot 场景区分来源。
+        ignore_seen（v2.1.0）：回溯时忽略 state 的已归档 id 过滤——
+            补全缺口（文件被删/截断）场景下，去重以文件内容为权威。
+        返回本次新增写入的条数（v2.1.0：与既有文件合并后的实际新增数）。
         注意：NapCat 返回的 message_seq = message_id（全局消息 ID），
         并非单调递增，不能用作增量游标；因此使用 time 做边界，
         并用已写 message_id 集合做去重（避免同秒消息重复/遗漏）。
@@ -540,12 +545,15 @@ class NapcatHistoryExporter(Star):
         start = 0
         fetched: list = []
         guard = 0
-        local_seen = set(seen)  # v1.3.3: 本轮已收集 id，防页间重叠
+        # v2.1.0: ignore_seen 用于回溯补全（启动检查/手动回溯）——文件才是
+        # 唯一权威，若按 state 的已归档 id 过滤，已删文件的记录将无法重建；
+        # 页间防重叠仍由 local_seen 在本轮内维护
+        local_seen = set() if (ignore_seen and start_ts > 0) else set(seen)
         consecutive_empty = 0  # v1.3.4: 连续无新增页数，防翻页死循环
         while True:
             guard += 1
-            if guard > 100:  # 防御：单次最多翻 100 页
-                logger.warning(f"[NapCatExporter] {target_id} 翻页超过 100 页，强制停止")
+            if guard > 600:  # 防御：单次最多翻 600 页
+                logger.warning(f"[NapCatExporter] {target_id} 翻页超过 600 页，强制停止")
                 break
             msgs = await self._fetch(action, key, target_id, start,
                                       self.batch, client=client)
@@ -655,8 +663,7 @@ class NapcatHistoryExporter(Star):
             for date, msgs in by_date.items():
                 path = self._target_path(chat, target_id, date)
                 records = [self._fmt_record(m, chat, target_id) for m in msgs]
-                self._merge_write(path, records)
-                written += len(records)
+                written += self._merge_write(path, records)  # v2.1.0: 实际新增数
             # 更新游标：time 边界 + 最近 5000 个已写 message_id
             max_t = max(self._time_of(m) for m in new)
             new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
@@ -855,7 +862,7 @@ class NapcatHistoryExporter(Star):
                 try:
                     n = await self._export_target(
                         chat, tid, start_ts=start_ts, end_ts=end_ts,
-                        client=client, bot_tag=bot_tag)
+                        client=client, bot_tag=bot_tag, ignore_seen=True)
                 except Exception as e:
                     logger.error(f"[归档检查] {label} {day} 检查失败: {e}")
                     n = 0
@@ -1054,7 +1061,7 @@ class NapcatHistoryExporter(Star):
                 return f"❌ 群号格式错误：{group_id}。群号应为纯数字。"
             written = await self._export_target(
                 "group", gid, start_ts=start_ts, end_ts=end_ts,
-                client=client, bot_tag=bot_tag)
+                client=client, bot_tag=bot_tag, ignore_seen=True)
             return (f"✅ 群 {gid} 归档完成：新增 {written} 条"
                     f"（{bot_tag}，导出目录: {self.export_dir}）")
         # 该 bot 的全部群
@@ -1071,7 +1078,7 @@ class NapcatHistoryExporter(Star):
             try:
                 n = await self._export_target(
                     "group", gid, start_ts=start_ts, end_ts=end_ts,
-                    client=client, bot_tag=bot_tag)
+                    client=client, bot_tag=bot_tag, ignore_seen=True)
                 total += n
             except Exception as e:
                 logger.error(f"[{bot_tag}] 归档群 {gid} 失败: {e}")
