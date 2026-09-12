@@ -1,7 +1,7 @@
 name: astrbot_plugin_chat_history_archiver
 desc: 通过 NapCat / SnowLuma（OneBot v11 扩展 API）将历史聊天记录（群/私聊）导出为 JSONL 文件，图片/表情等用占位符替换；支持定时循环增量导出、按需回溯归档、多 bot（多 aiocqhttp 实例）独立归档与后端自动探测
 author: baizi51676-source
-version: 2.0.0
+version: 2.1.0
 repo: https://github.com/baizi51676-source/astrbot_plugin_chat_history_archiver
 display_name: snowluma和napcat历史消息归档与查看
 short_desc: 导出 NapCat/SnowLuma 历史聊天记录为 JSONL（定时增量/多 bot/按需触发）
@@ -18,6 +18,14 @@ config:
     type: int
     default: 120
     description: 定时循环间隔（秒，最小 30）
+  startup_verify:
+    type: bool
+    default: true
+    description: 启动时自动检查归档文件并补全缺口（缺失日期/不全记录）
+  verify_days:
+    type: int
+    default: 3
+    description: 启动检查范围：最近 N 天（1-30）
   count_per_batch:
     type: int
     default: 50

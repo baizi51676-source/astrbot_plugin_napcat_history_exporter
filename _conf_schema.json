@@ -23,6 +23,18 @@
     "default": 120,
     "hint": "自动归档模式下的检查间隔，最小 30 秒。"
   },
+  "startup_verify": {
+    "description": "启动时自动补全缺口",
+    "type": "bool",
+    "default": true,
+    "hint": "每次插件启动时，自动检查最近若干天的归档文件，与后端拉取到的消息对比，补齐缺失的日期或不全的记录（后台进行，不影响正常使用）。"
+  },
+  "verify_days": {
+    "description": "启动检查范围（天）",
+    "type": "int",
+    "default": 3,
+    "hint": "启动检查覆盖最近多少天（1-30）。范围越大启动检查耗时越长（每群每天需拉取检查一次）；建议不超过历史文件保留天数。"
+  },
   "whitelist": {
     "description": "自动归档群白名单",
     "type": "list",

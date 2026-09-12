@@ -65,6 +65,11 @@ class NapcatHistoryExporter(Star):
         self._backend: str | None = None      # 后端探测结果缓存: "napcat" / "snowluma"
         self._qq_cache: dict = {}             # 平台实例 id -> 登录 QQ号（get_login_info）
         self._qq_cache_ts: float = 0.0
+        # v2.1.0: 启动归档检查（自动补全缺失日期/不全记录）
+        self.startup_verify = bool(config.get("startup_verify", True))
+        self.verify_days = max(1, min(int(config.get("verify_days", 3) or 3), 30))
+        self._verify_task: asyncio.Task | None = None
+        self._file_lock = asyncio.Lock()      # 写入段串行化（并发任务防护）
 
     # ---------------------------------------------------------------
     # 内部工具
@@ -83,6 +88,27 @@ class NapcatHistoryExporter(Star):
                 encoding="utf-8")
         except Exception as e:
             logger.error(f"保存导出状态失败: {e}")
+
+    def _scan_archived_targets(self) -> list:
+        """v2.1.0: 扫描导出目录，收集已有归档记录的目标 [(chat, target_id)]。"""
+        import re as _re
+        out: list = []
+        seen: set = set()
+        pat = _re.compile(r"^napcat_(private_)?(\d+)_\d{4}-\d{2}-\d{2}\.jsonl$")
+        try:
+            for f in self.export_dir.glob("napcat_*_????-??-??.jsonl"):
+                m = pat.match(f.name)
+                if not m:
+                    continue
+                chat = "private" if m.group(1) else "group"
+                tid = m.group(2)
+                key = (chat, tid)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        except Exception as e:
+            logger.error(f"[归档检查] 扫描导出目录失败: {e}")
+        return out
 
     def _is_allowed(self, event: AstrMessageEvent) -> bool:
         if not self.admin_only:
@@ -616,37 +642,39 @@ class NapcatHistoryExporter(Star):
                     break
         if not fetched:
             return 0
-        # 按 time 排序
-        new = sorted(fetched[:limit] if limit > 0 else fetched,
-                     key=self._time_of)
-        # 按天分文件写入（v1.3.3: 统一合并-去重-排序-重写，文件自愈）
-        written = 0
-        by_date: dict = {}
-        for m in new:
-            by_date.setdefault(self._date_of(m), []).append(m)
-        for date, msgs in by_date.items():
-            path = self._target_path(chat, target_id, date)
-            records = [self._fmt_record(m, chat, target_id) for m in msgs]
-            self._merge_write(path, records)
-            written += len(records)
-        # 更新游标：time 边界 + 最近 5000 个已写 message_id
-        max_t = max(self._time_of(m) for m in new)
-        new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
-        seen |= set(new_ids)
-        cur = self._state.setdefault(chat, {})
-        if today_only:
-            # v1.3.2: 当天模式游标不推进（固定为今天 0 点 -1 秒），
-            # 每轮都尝试拉取当天全部消息，配合 message_id 去重：
-            # 翻页失败时也不漏"最新"消息，翻页可用时能补全当天更早的
-            cur[target_id] = {"t": today_start - 1,
-                              "ids": list(seen)[-5000:]}
-        elif start_ts > 0:
-            # v1.4.0: 回溯时间段归档不推进游标（不影响后续增量），仅更新去重 ids
-            cur[target_id] = {"t": last_t, "ids": list(seen)[-5000:]}
-        else:
-            cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
-        self._save_state()
-        return written
+        # v2.1.0: 写入段串行化（启动归档检查 / 手动 / 循环任务并发防护）
+        async with self._file_lock:
+            # 按 time 排序
+            new = sorted(fetched[:limit] if limit > 0 else fetched,
+                         key=self._time_of)
+            # 按天分文件写入（v1.3.3: 统一合并-去重-排序-重写，文件自愈）
+            written = 0
+            by_date: dict = {}
+            for m in new:
+                by_date.setdefault(self._date_of(m), []).append(m)
+            for date, msgs in by_date.items():
+                path = self._target_path(chat, target_id, date)
+                records = [self._fmt_record(m, chat, target_id) for m in msgs]
+                self._merge_write(path, records)
+                written += len(records)
+            # 更新游标：time 边界 + 最近 5000 个已写 message_id
+            max_t = max(self._time_of(m) for m in new)
+            new_ids = [self._mid_of(m) for m in new if self._mid_of(m)]
+            seen |= set(new_ids)
+            cur = self._state.setdefault(chat, {})
+            if today_only:
+                # v1.3.2: 当天模式游标不推进（固定为今天 0 点 -1 秒），
+                # 每轮都尝试拉取当天全部消息，配合 message_id 去重：
+                # 翻页失败时也不漏"最新"消息，翻页可用时能补全当天更早的
+                cur[target_id] = {"t": today_start - 1,
+                                  "ids": list(seen)[-5000:]}
+            elif start_ts > 0:
+                # v1.4.0: 回溯时间段归档不推进游标（不影响后续增量），仅更新去重 ids
+                cur[target_id] = {"t": last_t, "ids": list(seen)[-5000:]}
+            else:
+                cur[target_id] = {"t": max_t, "ids": list(seen)[-5000:]}
+            self._save_state()
+            return written
 
     async def _auto_export_once(self, apply_rules: bool = True) -> int:
         """定时一轮：遍历所有“启用归档”的 aiocqhttp 实例（多 bot），
@@ -762,12 +790,100 @@ class NapcatHistoryExporter(Star):
         if removed:
             logger.info(f"[NapCatExporter] 本轮自动清理 {removed} 个过期文件")
 
+    async def _startup_verify_once(self) -> int:
+        """v2.1.0: 启动归档检查——对已归档目标逐天回溯补全最近 verify_days 天缺口。
+
+        对导出目录中已有归档的目标（群/私聊），逐天拉取最近 N 天消息并与现有
+        文件幂等合并（按 id 去重）：
+          - 整天空洞（文件缺失但该天有消息）→ 生成补全；
+          - 记录不全（文件存在但缺少部分消息）→ 补齐差值。
+        超出自动清理保留期的天跳过；后端（SL/NapCat）本地无记录的消息无法补。
+        """
+        if not self.startup_verify:
+            return 0
+        logger.info(f"[归档检查] 启动检查开始：范围最近 {self.verify_days} 天")
+        # 等平台连接就绪（最多 3 次尝试，间隔 10s）
+        clients = []
+        for i in range(3):
+            try:
+                clients = await self._get_clients()
+            except Exception:
+                clients = []
+            if clients:
+                break
+            if i < 2:
+                await asyncio.sleep(10)
+        if not clients:
+            logger.warning("[归档检查] 未获取到可用的 aiocqhttp 客户端，跳过本次检查")
+            return 0
+        targets = self._scan_archived_targets()
+        if not targets:
+            logger.info("[归档检查] 导出目录暂无已归档目标，跳过检查")
+            return 0
+        # 群 → 首选客户端映射（多 bot 场景：优先用能看到该群的实例拉取）
+        gid2client: dict = {}
+        for pid, qq, client in clients:
+            try:
+                groups = await client.call_action("get_group_list") or []
+            except Exception:
+                groups = []
+            for g in groups:
+                gid = str(g.get("group_id", ""))
+                if gid and gid not in gid2client:
+                    gid2client[gid] = (pid, qq, client)
+        today = datetime.now().date()
+        cutoff = today - timedelta(days=self.clean_days)  # 自动清理保留期边界
+        total = 0
+        t0 = time.time()
+        for back in range(self.verify_days):
+            day = today - timedelta(days=back)
+            if self.auto_clean and day < cutoff:
+                logger.info(f"[归档检查] {day} 已超出保留期"
+                            f"（{self.clean_days} 天），跳过补全")
+                continue
+            start_ts = int(datetime.combine(day, datetime.min.time()).timestamp())
+            end_ts = int(datetime.combine(day, datetime.max.time()).timestamp())
+            if day == today:
+                end_ts = int(time.time())
+            for chat, tid in targets:
+                label = f"群 {tid}" if chat == "group" else f"私聊 {tid}"
+                if chat == "group" and tid in gid2client:
+                    pid, qq, client = gid2client[tid]
+                else:
+                    pid, qq, client = clients[0]
+                bot_tag = f"bot[{qq or pid or '?'}]"
+                try:
+                    n = await self._export_target(
+                        chat, tid, start_ts=start_ts, end_ts=end_ts,
+                        client=client, bot_tag=bot_tag)
+                except Exception as e:
+                    logger.error(f"[归档检查] {label} {day} 检查失败: {e}")
+                    n = 0
+                if n:
+                    logger.info(f"[归档检查] {label} {day} 补齐 {n} 条")
+                total += n
+                await asyncio.sleep(0.3)
+        logger.info(f"[归档检查] 完成：{len(targets)} 个目标 × 最多 "
+                    f"{self.verify_days} 天，共补齐 {total} 条，"
+                    f"耗时 {time.time() - t0:.0f}s")
+        return total
+
+    async def _verify_safe(self) -> None:
+        """v2.1.0: 启动检查的安全包装（异常不外抛，不影响主流程）。"""
+        try:
+            await self._startup_verify_once()
+        except Exception as e:
+            logger.error(f"[归档检查] 启动检查异常: {e}")
+
     async def _auto_loop(self) -> None:
         logger.info(f"定时导出循环已启动，间隔 {self.interval}s，"
                     f"导出目录: {self.export_dir.resolve()}"
                     + (f"，白名单: {self.whitelist}" if self.whitelist else "")
                     + (f"，自动清理: {self.clean_days}天前"
                        if self.auto_clean else "，自动清理: 关闭"))
+        # v2.1.0: 启动归档检查（一次性；与定时循环同一任务，天然串行）
+        if self.startup_verify:
+            await self._verify_safe()
         while True:
             try:
                 await self._auto_export_once()
@@ -796,6 +912,9 @@ class NapcatHistoryExporter(Star):
             logger.info("NapCat 历史导出器自动归档已关闭，"
                         "仅在被 LLM 工具触发时归档（导出目录: %s）",
                         self.export_dir.resolve())
+            # v2.1.0: 自动归档关闭时，启动检查仍按配置执行（独立任务）
+            if self.startup_verify:
+                self._verify_task = asyncio.create_task(self._verify_safe())
 
     async def terminate(self) -> None:
         if self._task:
@@ -805,6 +924,13 @@ class NapcatHistoryExporter(Star):
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._verify_task:
+            self._verify_task.cancel()
+            try:
+                await self._verify_task
+            except asyncio.CancelledError:
+                pass
+            self._verify_task = None
 
     # ---------------------------------------------------------------
     # LLM 工具
